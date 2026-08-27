@@ -2,7 +2,7 @@
 
 import { MAX_CHARS, type Sanitised } from "@/lib/grid";
 import { PRESETS, type Preset } from "@/lib/palette";
-import type { RenderParams } from "@/lib/render";
+import type { RenderParams, ViewMode } from "@/lib/render";
 
 type Props = {
   text: string;
@@ -14,6 +14,9 @@ type Props = {
   setPresetId: (id: string) => void;
   onExportPNG: () => void;
   onExportSVG: () => void;
+  onExportFourier: () => void;
+  onCopyDesmos: () => void;
+  equationNote: string | null;
 };
 
 export default function Sidebar(p: Props) {
@@ -43,6 +46,38 @@ export default function Sidebar(p: Props) {
             {p.clean.dropped > 0 && `${p.clean.dropped} unsupported character(s) removed. `}
             {p.clean.truncated && `Trimmed to ${MAX_CHARS}: past that the hue steps get too small to decode.`}
           </Notice>
+        )}
+      </Group>
+
+      <Group label="View">
+        <div className="flex gap-[3px]">
+          {(
+            [
+              ["iso", "Isometric"],
+              ["flat", "Flat"],
+            ] as [ViewMode, string][]
+          ).map(([id, label]) => (
+            <button
+              key={id}
+              onClick={() => set("mode")(id)}
+              data-pressed={p.params.mode === id}
+              className="w-out w-btn flex-1"
+            >
+              {label}
+            </button>
+          ))}
+        </div>
+        {p.params.mode === "iso" && (
+          <label className="flex items-start gap-1.5">
+            <input type="checkbox" checked={p.params.stems} onChange={(e) => set("stems")(e.target.checked)} />
+            <span>
+              Stems
+              <span className="block text-[var(--shadow)]">
+                Drop lines to the base plane. These carry the character order as geometry, which
+                survives what colour does not. Without them the image decodes by hue alone.
+              </span>
+            </span>
+          </label>
         )}
       </Group>
 
@@ -105,6 +140,22 @@ export default function Sidebar(p: Props) {
         <p className="text-[var(--shadow)]">
           PNG is 2048 px on the short edge. Decode from PNG only: JPEG damages hue first.
         </p>
+      </Group>
+
+      <Group label="Equation">
+        <div className="flex gap-[3px]">
+          <button onClick={p.onExportFourier} className="w-out w-btn flex-1 min-w-0">
+            Fourier
+          </button>
+          <button onClick={p.onCopyDesmos} className="w-out w-btn flex-1 min-w-0">
+            Desmos
+          </button>
+        </div>
+        <p className="text-[var(--shadow)]">
+          The path as a truncated Fourier series; height is exactly linear in t, so it needs no
+          fit. Desmos copies a paste-ready block.
+        </p>
+        {p.equationNote && <Notice>{p.equationNote}</Notice>}
       </Group>
     </aside>
   );

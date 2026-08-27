@@ -1,24 +1,29 @@
 /**
- * Image -> text.
+ * Image -> text. Two decoders, tried in order.
  *
- * The curve carries no markers, so "which cells were visited" cannot be read off
- * the path geometry -- a spline from A to Z sweeps over cells it never visited.
- * What makes it recoverable is that hue advances uniformly per character step
- * (see palette.hueAt): with N characters, knot k sits at exactly hue
- * k * HUE_SPAN / (N - 1). So the decoder needs N, and then it can sample the
- * curve at N specific hues and ignore everything in between.
+ * ISOMETRIC (geometric). Each character drops a stem from its knot to the base
+ * plane. The z axis projects to pure screen-vertical, so a stem is an exactly
+ * vertical line whose foot unprojects to a grid cell -- the character -- and
+ * whose length encodes where it sits in the message. Sorting the stems by length
+ * recovers the order outright, with no absolute calibration and immune to any
+ * constant bias in how the lengths are measured. Colour is only a cross-check
+ * here, which is the point: geometry survives recompression and rescaling that
+ * destroy hue.
  *
- * N comes from the calibration bar (one swatch per character). If the bar is
- * missing, N is recovered by fitting: the true N places every sample on a cell
- * centre, a wrong N places samples mid-transit.
+ * FLAT (photometric). No stems, so order has to come from colour. Hue advances
+ * uniformly per character step (see palette.hueAt): with N characters, knot k
+ * sits at exactly hue k * HUE_SPAN / (N - 1), so the decoder samples the curve
+ * at N specific hues and ignores everything between them. N comes from the
+ * calibration bar, or is fitted if the bar is missing.
  *
- * Assumes an uncropped export -- the grid's position is derived from the image
- * dimensions via plotRect.
+ * Both assume an uncropped export -- the scene's placement is derived from the
+ * image dimensions alone, via plotRect / isoRect.
  */
 
 import { CELL_PITCH, CHARSET, OFFSET_R, cellCenter, nearestCell, MAX_CHARS, type Point } from "./grid.ts";
-import { HUE_SPAN, HUE_START, rgbToHsv } from "./palette.ts";
+import { HUE_SPAN, HUE_START, hueAt, rgbToHsv } from "./palette.ts";
 import { plotRect } from "./render.ts";
+import { fromPx, isoRect, type IsoRect } from "./iso.ts";
 
 export type ImageDataLike = {
   width: number;
@@ -39,10 +44,13 @@ export type DecodeResult = {
   text: string;
   chars: DecodedChar[];
   knotCount: number;
-  source: "calibration-bar" | "fit";
+  mode: "iso" | "flat";
+  source: "stem-geometry" | "calibration-bar" | "fit";
   warnings: string[];
   /** Image-pixel positions of the traced hue ramp, for the debug overlay. */
   trace: Point[];
+  /** Detected stems, for the debug overlay. */
+  stems: { foot: Point; top: Point }[];
   maskedPixels: number;
 };
 
@@ -58,7 +66,9 @@ const BINS = 1024;
  * hue bin and drag its centroid to the crossing point, which wrecks dense
  * artwork. Clipping to the core removes the problem rather than compensating for it.
  */
-const MASK_CORE = { s: 0.62, v: 0.85 };
+const MASK_CORE = { s: 0.62, v: 0.78 };
+/** Stems only: same hue as the curve, but a strictly darker band (palette.STEM_LIGHT). */
+const MASK_STEM = { s: 0.7, vMin: 0.5, vMax: 0.76 };
 /** Fallback for images whose core no longer survives the tight mask (recompressed, rescaled). */
 const MASK_LOOSE = { s: 0.45, v: 0.35 };
 /** Below this many core pixels, assume the tight mask was too strict for this image. */
@@ -83,7 +93,12 @@ type Bins = {
 
 type Rect = ReturnType<typeof plotRect>;
 
+/** Isometric first: if stems are present, geometry beats colour. */
 export function decode(img: ImageDataLike): DecodeResult {
+  return decodeIso(img) ?? decodeFlat(img);
+}
+
+function decodeFlat(img: ImageDataLike): DecodeResult {
   const { width: W, height: H } = img;
   const r = plotRect(W, H);
   const warnings: string[] = [];
@@ -105,11 +120,13 @@ export function decode(img: ImageDataLike): DecodeResult {
       text: "",
       chars: [],
       knotCount: 0,
+      mode: "flat",
       source: "fit",
       warnings: [
-        "No saturated curve found. Is this a Chromograph export? Monochromatic Ink carries no hue and cannot be decoded.",
+        "No saturated curve found. Is this a Chromograph export? The Grayscale palette carries no hue and cannot be decoded.",
       ],
       trace,
+      stems: [],
       maskedPixels: bins.masked,
     };
   }
@@ -149,10 +166,189 @@ export function decode(img: ImageDataLike): DecodeResult {
     text: chars.map((c) => c.char).join(""),
     chars,
     knotCount,
+    mode: "flat",
     source,
     warnings,
     trace,
+    stems: [],
     maskedPixels: bins.masked,
+  };
+}
+
+// --- isometric: geometric decode -------------------------------------------
+
+/** A stem is one column-run per pixel of its width; these get merged into one. */
+type ColumnRun = { x: number; top: number; bot: number; hue: number };
+
+type Stem = { footX: number; footY: number; len: number; hue: number; width: number };
+
+/** Stems shorter than this are noise, not the first character. */
+const MIN_STEM_FRACTION = 1 / 400;
+/** A stem is one flat colour; the curve's is always changing. */
+const STEM_HUE_FLAT = 2.5;
+
+/**
+ * Scan each pixel column for vertical runs of near-constant hue.
+ *
+ * Two filters separate stems from the curve. A stem is drawn in a single hue
+ * while the curve's hue changes continuously along its length, and a stem's foot
+ * sits on the base plane, which the curve never touches -- the lowest knot is at
+ * z = 1/N, not 0.
+ */
+function findStems(img: ImageDataLike, r: IsoRect, yMax: number): Stem[] {
+  const { width: W, data } = img;
+  const runs: ColumnRun[] = [];
+  const minLen = Math.max(4, r.zPx * MIN_STEM_FRACTION);
+
+  for (let x = 0; x < W; x++) {
+    let start = -1;
+    let hmin = 0;
+    let hmax = 0;
+    for (let y = 0; y <= yMax; y++) {
+      let hue = -1;
+      if (y < yMax) {
+        const i = (y * W + x) * 4;
+        if (data[i + 3] >= 128) {
+          const { h, s, v } = rgbToHsv(data[i], data[i + 1], data[i + 2]);
+          if (s >= MASK_STEM.s && v >= MASK_STEM.vMin && v <= MASK_STEM.vMax) hue = h;
+        }
+      }
+      if (hue >= 0) {
+        if (start < 0) {
+          start = y;
+          hmin = hmax = hue;
+        } else {
+          if (hue < hmin) hmin = hue;
+          if (hue > hmax) hmax = hue;
+        }
+        continue;
+      }
+      if (start >= 0) {
+        const len = y - start;
+        if (len >= minLen && hmax - hmin <= STEM_HUE_FLAT) {
+          const foot = fromPx(x, y - 1, 0, r);
+          const onBase = foot.x >= -0.04 && foot.x <= 1.04 && foot.y >= -0.04 && foot.y <= 1.04;
+          if (onBase) runs.push({ x, top: start, bot: y - 1, hue: (hmin + hmax) / 2 });
+        }
+        start = -1;
+      }
+    }
+  }
+
+  return mergeRuns(runs);
+}
+
+/** Adjacent columns sharing a foot are one stem seen across its stroke width. */
+function mergeRuns(runs: ColumnRun[]): Stem[] {
+  type Open = { xs: number[]; bots: number[]; lens: number[]; hues: number[]; lastX: number };
+  const open: Open[] = [];
+  const done: Open[] = [];
+
+  for (const run of runs) {
+    const hit = open.find((o) => run.x - o.lastX <= 1 && Math.abs(o.bots[o.bots.length - 1] - run.bot) <= 2);
+    if (hit) {
+      hit.xs.push(run.x);
+      hit.bots.push(run.bot);
+      hit.lens.push(run.bot - run.top + 1);
+      hit.hues.push(run.hue);
+      hit.lastX = run.x;
+    } else {
+      open.push({ xs: [run.x], bots: [run.bot], lens: [run.bot - run.top + 1], hues: [run.hue], lastX: run.x });
+    }
+    for (let i = open.length - 1; i >= 0; i--) {
+      if (run.x - open[i].lastX > 2) done.push(...open.splice(i, 1));
+    }
+  }
+  done.push(...open);
+
+  const mid = (a: number[]) => [...a].sort((p, q) => p - q)[a.length >> 1];
+  return done.map((o) => ({
+    footX: (Math.min(...o.xs) + Math.max(...o.xs)) / 2,
+    footY: mid(o.bots),
+    len: mid(o.lens),
+    hue: mid(o.hues),
+    width: o.xs.length,
+  }));
+}
+
+/**
+ * Sorting stems by length recovers the message order directly: stem k has length
+ * proportional to (k + 1), so ascending length IS ascending character index. No
+ * absolute scale is needed, and any constant measurement bias -- antialiasing,
+ * the curve's own thickness overlapping the stem's top -- cancels out entirely.
+ *
+ * Gaps matter though: if a stem was missed (hidden behind another), the ranks
+ * after it would all shift by one. So ranks advance by the rounded ratio of each
+ * length step to the typical step, and a skipped index becomes a '?'.
+ */
+function decodeIso(img: ImageDataLike): DecodeResult | null {
+  const { width: W, height: H } = img;
+  const r = isoRect(W, H);
+  const stems = findStems(img, r, Math.min(H, Math.floor(r.bar.y)));
+  if (stems.length < 2) return null;
+
+  stems.sort((a, b) => a.len - b.len);
+  const diffs: number[] = [];
+  for (let i = 1; i < stems.length; i++) diffs.push(stems[i].len - stems[i - 1].len);
+  const step = [...diffs].sort((a, b) => a - b)[diffs.length >> 1];
+  if (!(step > 0.5)) return null;
+
+  const slots = new Map<number, Stem>();
+  let k = 0;
+  slots.set(0, stems[0]);
+  for (let i = 1; i < stems.length; i++) {
+    k += Math.max(1, Math.round((stems[i].len - stems[i - 1].len) / step));
+    slots.set(k, stems[i]);
+  }
+  const knotCount = k + 1;
+
+  const warnings: string[] = [];
+  const missing = knotCount - stems.length;
+  if (missing > 0) {
+    warnings.push(`${missing} stem(s) could not be seen, probably hidden behind the curve. Those characters are unknown.`);
+  }
+
+  const chars: DecodedChar[] = [];
+  let hueMismatch = 0;
+  for (let i = 0; i < knotCount; i++) {
+    const stem = slots.get(i);
+    if (!stem) {
+      chars.push({ char: "?", cell: -1, confidence: 0, at: null });
+      continue;
+    }
+    const g = fromPx(stem.footX, stem.footY, 0, r);
+    const { cell, dist } = nearestCell(g);
+    // Colour is redundant here, so a disagreement is a warning rather than a vote.
+    if (Math.abs(stem.hue - hueAt(i, knotCount)) > HUE_SPAN / Math.max(1, knotCount - 1)) hueMismatch++;
+    chars.push({
+      char: CHARSET[cell],
+      cell,
+      confidence: Math.max(0, 1 - legalDist(dist) / SNAP_TOL),
+      at: { x: stem.footX, y: stem.footY },
+    });
+  }
+
+  if (hueMismatch > 0) {
+    warnings.push(`${hueMismatch} character(s) have a colour that disagrees with their stem height.`);
+  }
+  const weak = chars.filter((c) => c.confidence < 0.35 && c.cell >= 0).length;
+  if (weak > 0) warnings.push(`${weak} stem foot/feet landed between grid cells and are low confidence.`);
+
+  const bar = readCalibrationBar(img, r.bar);
+  if (bar && bar.count !== knotCount) {
+    warnings.push(`The calibration bar shows ${bar.count} characters but ${knotCount} stems were resolved.`);
+  }
+
+  return {
+    text: chars.map((c) => c.char).join(""),
+    chars,
+    knotCount,
+    mode: "iso",
+    source: "stem-geometry",
+    warnings,
+    trace: [],
+    stems: stems.map((s) => ({ foot: { x: s.footX, y: s.footY }, top: { x: s.footX, y: s.footY - s.len } })),
+    maskedPixels: stems.reduce((a, s) => a + s.len * s.width, 0),
   };
 }
 

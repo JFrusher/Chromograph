@@ -1,7 +1,8 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { CELLS, cellCenter } from "@/lib/grid";
+import { CELLS, COLS, ROWS, cellCenter } from "@/lib/grid";
+import { isoRect, toPx as isoToPx } from "@/lib/iso";
 import { decode, gridToImage, type DecodeResult } from "@/lib/decode";
 
 /** Bounds the decode passes and the debug canvas on huge uploads. */
@@ -144,9 +145,19 @@ export default function Decoder({ getCurrentImage }: Props) {
 
             <table className="w-full">
               <tbody>
-                <Row k="Length source" v={result.source === "calibration-bar" ? "calibration bar" : "curve fit"} />
+                <Row k="Read from" v={result.mode === "iso" ? "stem geometry" : "hue"} />
+                <Row
+                  k="Length source"
+                  v={
+                    result.source === "stem-geometry"
+                      ? "stem count"
+                      : result.source === "calibration-bar"
+                        ? "calibration bar"
+                        : "curve fit"
+                  }
+                />
                 <Row k="Characters" v={String(result.knotCount)} />
-                <Row k="Curve pixels" v={result.maskedPixels.toLocaleString()} />
+                <Row k={result.mode === "iso" ? "Stem pixels" : "Curve pixels"} v={result.maskedPixels.toLocaleString()} />
               </tbody>
             </table>
 
@@ -178,7 +189,7 @@ function Notice({ children }: { children: React.ReactNode }) {
   );
 }
 
-/** Dimmed source image + traced hue ramp + where each character was sampled. */
+/** Dimmed source image + what the decoder actually found. */
 function drawOverlay(ctx: CanvasRenderingContext2D, W: number, H: number, out: DecodeResult) {
   const s = Math.min(W, H) / 1000;
   ctx.fillStyle = "rgba(0,0,0,0.66)";
@@ -187,11 +198,39 @@ function drawOverlay(ctx: CanvasRenderingContext2D, W: number, H: number, out: D
   ctx.strokeStyle = "rgba(255,255,255,0.3)";
   ctx.lineWidth = Math.max(1, s);
   ctx.beginPath();
-  for (let i = 0; i < CELLS; i++) {
-    const p = gridToImage(cellCenter(i), W, H);
-    ctx.rect(p.x - 13 * s, p.y - 13 * s, 26 * s, 26 * s);
+  if (out.mode === "iso") {
+    // The base plane the stem feet were measured against.
+    const r = isoRect(W, H);
+    for (let i = 0; i <= COLS; i++) {
+      const a = isoToPx({ x: i / COLS, y: 0, z: 0 }, r);
+      const b = isoToPx({ x: i / COLS, y: 1, z: 0 }, r);
+      ctx.moveTo(a.x, a.y);
+      ctx.lineTo(b.x, b.y);
+    }
+    for (let j = 0; j <= ROWS; j++) {
+      const a = isoToPx({ x: 0, y: j / ROWS, z: 0 }, r);
+      const b = isoToPx({ x: 1, y: j / ROWS, z: 0 }, r);
+      ctx.moveTo(a.x, a.y);
+      ctx.lineTo(b.x, b.y);
+    }
+  } else {
+    for (let i = 0; i < CELLS; i++) {
+      const p = gridToImage(cellCenter(i), W, H);
+      ctx.rect(p.x - 13 * s, p.y - 13 * s, 26 * s, 26 * s);
+    }
   }
   ctx.stroke();
+
+  if (out.stems.length > 0) {
+    ctx.strokeStyle = "#ffffff";
+    ctx.lineWidth = Math.max(1, s);
+    ctx.beginPath();
+    for (const stem of out.stems) {
+      ctx.moveTo(stem.top.x, stem.top.y);
+      ctx.lineTo(stem.foot.x, stem.foot.y);
+    }
+    ctx.stroke();
+  }
 
   if (out.trace.length > 1) {
     ctx.strokeStyle = "#ffffff";

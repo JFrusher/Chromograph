@@ -13,7 +13,10 @@ import { CHARSET, CELL_PITCH, cellCenter, nearestCell, sanitize, textToKnots, MA
 import { catmullRom } from "./spline.ts";
 import { HUE_SPAN, hueAt } from "./palette.ts";
 import { plotRect } from "./render.ts";
+import { isoRect, toPx as isoToPx, zOf } from "./iso.ts";
 import { decode, type ImageDataLike } from "./decode.ts";
+import { fromPx } from "./iso.ts";
+import { desmosText, fitFourier } from "./equation.ts";
 
 // --- grid -------------------------------------------------------------------
 
@@ -169,6 +172,66 @@ function rasterise(text: string, W: number, H: number, withBar = true): ImageDat
   return { width: W, height: H, data };
 }
 
+/** Isometric fixture: curve first, then stems on top, mirroring the renderer. */
+function rasteriseIso(text: string, W: number, H: number, withBar = true): ImageDataLike {
+  const data = new Uint8ClampedArray(W * H * 4);
+  for (let i = 0; i < W * H; i++) {
+    data[i * 4] = 5;
+    data[i * 4 + 1] = 3;
+    data[i * 4 + 2] = 15;
+    data[i * 4 + 3] = 255;
+  }
+  const put = (x: number, y: number, rgb: [number, number, number]) => {
+    if (x < 0 || y < 0 || x >= W || y >= H) return;
+    const i = (y * W + x) * 4;
+    data[i] = rgb[0];
+    data[i + 1] = rgb[1];
+    data[i + 2] = rgb[2];
+  };
+  const disc = (cx: number, cy: number, rad: number, rgb: [number, number, number]) => {
+    for (let y = Math.floor(cy - rad); y <= cy + rad; y++) {
+      for (let x = Math.floor(cx - rad); x <= cx + rad; x++) {
+        if (Math.hypot(x - cx, y - cy) <= rad) put(x, y, rgb);
+      }
+    }
+  };
+
+  const r = isoRect(W, H);
+  const scale = Math.min(W, H) / 1000;
+  const thickness = 6;
+  const knots = textToKnots(text);
+  const n = knots.length;
+  const { pts, seg } = catmullRom(knots, 1, Math.min(64, Math.max(8, Math.round(1500 / Math.max(1, n - 1)))));
+
+  for (let i = 0; i < pts.length; i++) {
+    const q = isoToPx({ x: pts[i].x, y: pts[i].y, z: zOf(seg[i], n) }, r);
+    disc(q.x, q.y, (thickness * scale) / 2, hslToRgb(hueAt(seg[i], n), 1, 0.55));
+  }
+
+  const gap = 1.6 * thickness * scale;
+  const half = (thickness * scale * 0.5) / 2;
+  for (let k = 0; k < n; k++) {
+    const top = isoToPx({ x: knots[k].x, y: knots[k].y, z: zOf(k, n) }, r);
+    const foot = isoToPx({ x: knots[k].x, y: knots[k].y, z: 0 }, r);
+    if (foot.y - top.y <= gap + 1) continue;
+    const rgb = hslToRgb(hueAt(k, n), 1, 0.35);
+    for (let y = Math.round(top.y + gap); y <= Math.round(foot.y); y++) {
+      for (let x = Math.round(top.x - half); x <= Math.round(top.x + half); x++) put(x, y, rgb);
+    }
+  }
+
+  if (withBar) {
+    const bw = r.bar.w / n;
+    for (let k = 0; k < n; k++) {
+      const rgb = hslToRgb(hueAt(k, n), 1, 0.5);
+      for (let y = Math.round(r.bar.y); y < r.bar.y + r.bar.h; y++) {
+        for (let x = Math.round(r.bar.x + k * bw); x < r.bar.x + (k + 1) * bw; x++) put(x, y, rgb);
+      }
+    }
+  }
+  return { width: W, height: H, data };
+}
+
 // --- decode -----------------------------------------------------------------
 
 test("roundtrip via the calibration bar", () => {
@@ -216,4 +279,79 @@ test("cell centres are unique and inside the unit square", () => {
     seen.add(`${c.x},${c.y}`);
   }
   assert.equal(seen.size, 30);
+});
+
+// --- isometric / geometric decode -------------------------------------------
+
+test("isometric roundtrip reads the message from stem geometry", () => {
+  const text = "HELLO WORLD";
+  const out = decode(rasteriseIso(text, 1400, 1400));
+  assert.equal(out.mode, "iso");
+  assert.equal(out.source, "stem-geometry");
+  assert.equal(out.knotCount, text.length);
+  assert.equal(out.text, text);
+});
+
+test("isometric decode does not need the calibration bar at all", () => {
+  const text = "GEOMETRY BEATS COLOUR";
+  const out = decode(rasteriseIso(text, 1600, 1600, false));
+  assert.equal(out.source, "stem-geometry");
+  assert.equal(out.text, text);
+});
+
+test("isometric roundtrip survives repeated letters", () => {
+  const text = "AAAA BBBB, CC?";
+  const out = decode(rasteriseIso(text, 1400, 1400));
+  assert.equal(out.text, text);
+});
+
+test("projection inverts exactly at any height", () => {
+  const r = isoRect(1200, 1200);
+  for (const z of [0, 0.25, 1]) {
+    for (const p of [{ x: 0.1, y: 0.9 }, { x: 0.5, y: 0.5 }, { x: 0.83, y: 0.17 }]) {
+      const q = isoToPx({ ...p, z }, r);
+      const back = fromPx(q.x, q.y, z, r);
+      assert.ok(Math.hypot(back.x - p.x, back.y - p.y) < 1e-9);
+    }
+  }
+});
+
+test("stems are exactly vertical, so z never leaks into screen x", () => {
+  const r = isoRect(1000, 1000);
+  const top = isoToPx({ x: 0.3, y: 0.7, z: 1 }, r);
+  const foot = isoToPx({ x: 0.3, y: 0.7, z: 0 }, r);
+  assert.ok(Math.abs(top.x - foot.x) < 1e-9);
+  assert.ok(Math.abs(foot.y - top.y - r.zPx) < 1e-9);
+});
+
+// --- equation ----------------------------------------------------------------
+
+test("Fourier fit reconstructs the path to a stated accuracy", () => {
+  const fit = fitFourier("HELLO WORLD");
+  assert.ok(fit);
+  assert.equal(fit.knotCount, 11);
+  assert.equal(fit.ax.length, fit.harmonics);
+  // Whole grid is 1x1 and a cell is 1/6 wide, so this is well under a cell.
+  assert.ok(fit.rms < 0.004, `rms ${fit.rms}`);
+});
+
+test("more harmonics never fit worse", () => {
+  const coarse = fitFourier("CHROMOGRAPH", 1, 8);
+  const fine = fitFourier("CHROMOGRAPH", 1, 64);
+  assert.ok(coarse && fine);
+  assert.ok(fine.rms <= coarse.rms);
+});
+
+test("Desmos export is a complete, paste-ready block", () => {
+  const fit = fitFourier("HI THERE");
+  assert.ok(fit);
+  const text = desmosText(fit);
+  assert.match(text, /^A_\{x\}=\[/m);
+  assert.match(text, /X\(t\)=/m);
+  assert.ok(text.includes("1-Y"), "plots y flipped for Desmos' upward axis");
+  assert.ok(!/NaN|undefined/.test(text));
+});
+
+test("a single character has no curve to fit", () => {
+  assert.equal(fitFourier("A"), null);
 });

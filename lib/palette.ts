@@ -58,6 +58,22 @@ export function colorFor(seg: number, knotCount: number, preset: Preset): string
   return `hsl(${hueAt(seg, knotCount).toFixed(2)}, ${preset.sat}%, ${preset.light}%)`;
 }
 
+/**
+ * Stems are drawn at this lightness, the curve at the preset's own (>= 42).
+ *
+ * The gap is deliberate and load-bearing. hsl(h, 100%, 35%) has HSV value 0.70,
+ * while every curve colour lands at 0.84 or above, so the decoder can mask
+ * stems and curve into two sets that cannot overlap -- while both keep the exact
+ * same hue, which is what lets colour still cross-check the geometry.
+ */
+export const STEM_LIGHT = 35;
+
+/** Colour of the stem dropped from knot k. Same hue as the curve, darker. */
+export function stemColorFor(k: number, knotCount: number, preset: Preset): string {
+  if (!preset.decodable) return `hsl(0, 0%, ${STEM_LIGHT}%)`;
+  return `hsl(${hueAt(k, knotCount).toFixed(2)}, ${preset.sat}%, ${STEM_LIGHT}%)`;
+}
+
 /** Ink colour that reads against a preset's background. */
 export function contrastInk(bg: string): { r: number; g: number; b: number } {
   const hex = bg.replace("#", "");

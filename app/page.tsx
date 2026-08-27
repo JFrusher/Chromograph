@@ -8,6 +8,7 @@ import { sanitize } from "@/lib/grid";
 import { presetById } from "@/lib/palette";
 import { DEFAULT_PARAMS, drawChromograph, type RenderParams } from "@/lib/render";
 import { toSVG } from "@/lib/svg";
+import { desmosText, fitFourier, fourierText } from "@/lib/equation";
 
 /** Short edge of a PNG export, in pixels. */
 const EXPORT_SHORT_EDGE = 2048;
@@ -18,6 +19,7 @@ export default function Page() {
   const [presetId, setPresetId] = useState("black");
   const [tab, setTab] = useState<"encode" | "decode">("encode");
   const [viewport, setViewport] = useState({ w: 1200, h: 900 });
+  const [equationNote, setEquationNote] = useState<string | null>(null);
 
   const preset = presetById(presetId);
   const clean = useMemo(() => sanitize(text), [text]);
@@ -57,6 +59,33 @@ export default function Page() {
     download(`${slug(clean.text)}.svg`, new Blob([svg], { type: "image/svg+xml" }));
   };
 
+  const exportFourier = () => {
+    const fit = fitFourier(clean.text, params.tension);
+    if (!fit) {
+      setEquationNote("Need at least two characters before there is a path to fit.");
+      return;
+    }
+    download(`${slug(clean.text)}-fourier.txt`, new Blob([fourierText(fit, clean.text)], { type: "text/plain" }));
+    setEquationNote(`${fit.harmonics} harmonics, ${((fit.rms / (1 / 6)) * 100).toFixed(1)}% of a cell RMS error.`);
+  };
+
+  const copyDesmos = async () => {
+    const fit = fitFourier(clean.text, params.tension);
+    if (!fit) {
+      setEquationNote("Need at least two characters before there is a path to fit.");
+      return;
+    }
+    const text = desmosText(fit);
+    try {
+      await navigator.clipboard.writeText(text);
+      setEquationNote(`Copied ${fit.harmonics} harmonics. Paste into a blank Desmos graph.`);
+    } catch {
+      // Clipboard needs a permission the page may not have; a file always works.
+      download(`${slug(clean.text)}-desmos.txt`, new Blob([text], { type: "text/plain" }));
+      setEquationNote("Clipboard was blocked, so it downloaded as a file instead.");
+    }
+  };
+
   const getCurrentImage = useCallback(() => {
     const rendered = renderOffscreen(1600, 1200);
     return rendered ? rendered.ctx.getImageData(0, 0, 1600, 1200) : null;
@@ -87,6 +116,9 @@ export default function Page() {
             setPresetId={setPresetId}
             onExportPNG={exportPNG}
             onExportSVG={exportSVG}
+            onExportFourier={exportFourier}
+            onCopyDesmos={copyDesmos}
+            equationNote={equationNote}
           />
 
           <div className="flex min-w-0 flex-1 flex-col p-1">
@@ -127,7 +159,14 @@ export default function Page() {
             {clean.text.length} character{clean.text.length === 1 ? "" : "s"}
           </StatusCell>
           <StatusCell>{preset.name}</StatusCell>
-          <StatusCell>{preset.decodable ? "Decodable" : "Art only"}</StatusCell>
+          <StatusCell>{params.mode === "iso" ? "Isometric" : "Flat"}</StatusCell>
+          <StatusCell>
+            {!preset.decodable
+              ? "Art only"
+              : params.mode === "iso" && params.stems
+                ? "Geometric + colour"
+                : "Colour only"}
+          </StatusCell>
         </div>
       </div>
     </div>
