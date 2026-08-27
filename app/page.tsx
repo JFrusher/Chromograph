@@ -27,7 +27,7 @@ export default function Page() {
   const [tab, setTab] = useState<"encode" | "decode">("encode");
   const [viewport, setViewport] = useState({ w: 1200, h: 900 });
   const [equationNote, setEquationNote] = useState<string | null>(null);
-  const [recording, setRecording] = useState(false);
+  const [busy, setBusy] = useState(false);
 
   const preset = presetById(presetId);
   const clean = useMemo(() => sanitize(text), [text]);
@@ -35,12 +35,12 @@ export default function Page() {
   const onResize = useCallback((w: number, h: number) => setViewport({ w, h }), []);
 
   /** Export keeps the viewport's aspect ratio, so the PNG frames like the screen does. */
-  const exportSize = () => {
+  const exportSize = useCallback(() => {
     const aspect = viewport.w / Math.max(1, viewport.h);
     return aspect >= 1
       ? { width: Math.round(EXPORT_SHORT_EDGE * aspect), height: EXPORT_SHORT_EDGE }
       : { width: EXPORT_SHORT_EDGE, height: Math.round(EXPORT_SHORT_EDGE / aspect) };
-  };
+  }, [viewport]);
 
   const renderOffscreen = useCallback(
     (width: number, height: number) => {
@@ -108,7 +108,7 @@ export default function Page() {
       setEquationNote("Need at least two characters to animate.");
       return;
     }
-    setRecording(true);
+    setBusy(true);
     try {
       const { width, height } = exportSize();
       const blob = await recordAnimation({
@@ -130,7 +130,7 @@ export default function Page() {
     } catch (err) {
       setEquationNote(err instanceof Error ? err.message : "Recording failed.");
     } finally {
-      setRecording(false);
+      setBusy(false);
     }
   };
 
@@ -157,13 +157,16 @@ export default function Page() {
    * Unlike WebM it needs nothing from the environment, so it works everywhere and
    * embeds anywhere.
    */
-  const exportGif = () => {
+  const exportGif = async () => {
     const n = clean.text.length;
     if (n < 2) {
       setEquationNote("Need at least two characters to animate.");
       return;
     }
-    setRecording(true);
+    setBusy(true);
+    // Encoding a long message blocks for seconds. Yield first, or React never
+    // gets to paint the disabled state and the UI just appears to freeze.
+    await nextPaint();
     try {
       const aspect = viewport.w / Math.max(1, viewport.h);
       const width = Math.round(aspect >= 1 ? GIF_EDGE * aspect : GIF_EDGE);
@@ -173,6 +176,7 @@ export default function Page() {
       for (let k = 0; k < n; k++) {
         const frame = renderFrame(k, n, width, height);
         if (frame) frames.push(frame);
+        if (k % 16 === 15) await nextPaint();
       }
       const palette = buildPalette(hexToRgb(preset.bg));
       const bytes = encodeGif({ frames, palette, lut: buildLookup(palette), delay: GIF_DELAY_CS });
@@ -181,7 +185,7 @@ export default function Page() {
     } catch (err) {
       setEquationNote(err instanceof Error ? err.message : "GIF export failed.");
     } finally {
-      setRecording(false);
+      setBusy(false);
     }
   };
 
@@ -192,45 +196,54 @@ export default function Page() {
    * The same frames as the WebM, tiled into one lossless PNG. No encoder and no
    * video playback needed to read it back, which makes it the dependable form.
    */
-  const exportSheet = () => {
+  const exportSheet = async () => {
     const n = clean.text.length;
     if (n < 2) {
       setEquationNote("Need at least two characters to make a sheet.");
       return;
     }
-    const aspect = viewport.w / Math.max(1, viewport.h);
-    const edge = tileEdge(n);
-    const tw = Math.round(aspect >= 1 ? edge * aspect : edge);
-    const th = Math.round(aspect >= 1 ? edge : edge / aspect);
-    const cols = sheetCols(n);
-    const rows = sheetRows(n);
+    setBusy(true);
+    await nextPaint();
+    try {
+      const aspect = viewport.w / Math.max(1, viewport.h);
+      const edge = tileEdge(n);
+      const tw = Math.round(aspect >= 1 ? edge * aspect : edge);
+      const th = Math.round(aspect >= 1 ? edge : edge / aspect);
+      const cols = sheetCols(n);
+      const rows = sheetRows(n);
 
-    const canvas = document.createElement("canvas");
-    canvas.width = cols * tw;
-    canvas.height = rows * th;
-    const ctx = canvas.getContext("2d");
-    if (!ctx) return;
-    ctx.fillStyle = preset.bg;
-    ctx.fillRect(0, 0, canvas.width, canvas.height);
+      const canvas = document.createElement("canvas");
+      canvas.width = cols * tw;
+      canvas.height = rows * th;
+      const ctx = canvas.getContext("2d");
+      if (!ctx) throw new Error("Could not open a canvas for the sheet.");
+      ctx.fillStyle = preset.bg;
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
 
-    for (let k = 0; k < n; k++) {
-      ctx.save();
-      ctx.translate((k % cols) * tw, Math.floor(k / cols) * th);
-      ctx.beginPath();
-      ctx.rect(0, 0, tw, th);
-      ctx.clip();
-      drawChromograph(ctx, {
-        text: clean.text,
-        params: { ...params, mode: "iso" },
-        preset,
-        width: tw,
-        height: th,
-        frame: { k, n },
-      });
-      ctx.restore();
+      for (let k = 0; k < n; k++) {
+        ctx.save();
+        ctx.translate((k % cols) * tw, Math.floor(k / cols) * th);
+        ctx.beginPath();
+        ctx.rect(0, 0, tw, th);
+        ctx.clip();
+        drawChromograph(ctx, {
+          text: clean.text,
+          params: { ...params, mode: "iso" },
+          preset,
+          width: tw,
+          height: th,
+          frame: { k, n },
+        });
+        ctx.restore();
+        if (k % 16 === 15) await nextPaint();
+      }
+      canvas.toBlob((blob) => blob && download(`${slug(clean.text)}-sheet.png`, blob), "image/png");
+      setEquationNote(`${n} frames as ${cols} x ${rows} tiles. This decodes exactly.`);
+    } catch (err) {
+      setEquationNote(err instanceof Error ? err.message : "Sheet export failed.");
+    } finally {
+      setBusy(false);
     }
-    canvas.toBlob((blob) => blob && download(`${slug(clean.text)}-sheet.png`, blob), "image/png");
-    setEquationNote(`${n} frames as ${cols} x ${rows} tiles. This decodes exactly.`);
   };
 
   // Renders at export resolution, so what this decodes is what a saved PNG would.
@@ -238,8 +251,7 @@ export default function Page() {
     const { width, height } = exportSize();
     const rendered = renderOffscreen(width, height);
     return rendered ? rendered.ctx.getImageData(0, 0, width, height) : null;
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [renderOffscreen, viewport.w, viewport.h]);
+  }, [renderOffscreen, exportSize]);
 
   return (
     <div className="h-full p-1">
@@ -269,14 +281,14 @@ export default function Page() {
             onExportAnimation={exportAnimation}
             onExportSheet={exportSheet}
             onExportGif={exportGif}
-            recording={recording}
+            busy={busy}
             onExportFourier={exportFourier}
             onCopyDesmos={copyDesmos}
             equationNote={equationNote}
           />
 
           <div className="flex min-w-0 flex-1 flex-col p-1">
-            <div className="flex gap-[2px] pl-1">
+            <div role="tablist" aria-label="Encode or decode" className="flex gap-[2px] pl-1">
               {(
                 [
                   ["encode", "Encode"],
@@ -285,6 +297,8 @@ export default function Page() {
               ).map(([id, label]) => (
                 <button
                   key={id}
+                  role="tab"
+                  aria-selected={tab === id}
                   onClick={() => setTab(id)}
                   className={`w-out border-b-0 px-3 py-[3px] ${tab === id ? "relative z-10 pb-[5px] font-bold" : ""}`}
                 >
@@ -296,12 +310,12 @@ export default function Page() {
             {/* Both panes stay mounted so switching tabs does not drop the
                 decoder's loaded image or force the canvas to re-measure. */}
             <div className="w-out relative min-h-0 flex-1 p-1">
-              <div className={`absolute inset-1 ${tab === "encode" ? "" : "invisible"}`}>
+              <div role="tabpanel" aria-hidden={tab !== "encode"} className={`absolute inset-1 ${tab === "encode" ? "" : "invisible"}`}>
                 <div className="w-in h-full p-1">
                   <CanvasView text={clean.text} params={params} preset={preset} onResize={onResize} />
                 </div>
               </div>
-              <div className={`absolute inset-1 overflow-hidden ${tab === "decode" ? "" : "invisible"}`}>
+              <div role="tabpanel" aria-hidden={tab !== "decode"} className={`absolute inset-1 overflow-hidden ${tab === "decode" ? "" : "invisible"}`}>
                 <Decoder getCurrentImage={getCurrentImage} />
               </div>
             </div>
@@ -325,6 +339,9 @@ export default function Page() {
   );
 }
 
+/** Lets the browser paint before a long synchronous stretch. */
+const nextPaint = () => new Promise((r) => requestAnimationFrame(() => setTimeout(r, 0)));
+
 function StatusCell({ children, className = "" }: { children: React.ReactNode; className?: string }) {
   return <div className={`w-in !bg-[var(--face)] px-1.5 py-[1px] ${className}`}>{children}</div>;
 }
@@ -346,5 +363,7 @@ function download(name: string, blob: Blob) {
   a.href = url;
   a.download = name;
   a.click();
-  URL.revokeObjectURL(url);
+  // Revoking in the same tick cancels the download in some browsers: the click
+  // only queues it. A minute is far longer than any browser needs to start.
+  setTimeout(() => URL.revokeObjectURL(url), 60_000);
 }

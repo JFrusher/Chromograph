@@ -56,11 +56,22 @@ export type PixelSource = { width: number; height: number; data: Uint8ClampedArr
 
 /** Returns null when the plate is absent or fails its parity check. */
 export function readFrameHeader(img: PixelSource): FrameHeader | null {
-  const { x, y, cell } = headerLayout(img.width, img.height);
+  return readHeaderAt(img, 0, 0, img.width, img.height);
+}
+
+/**
+ * Read a frame's header without slicing it out first.
+ *
+ * Sheet layouts are recovered by trying each candidate n, and cropping a full
+ * tile per candidate would allocate megabytes per guess for a file that may not
+ * be a sheet at all. Reading in place costs 23 pixel lookups.
+ */
+function readHeaderAt(img: PixelSource, ox: number, oy: number, w: number, h: number): FrameHeader | null {
+  const { x, y, cell } = headerLayout(w, h);
   const bits: number[] = [];
   for (let i = 0; i < CELLS; i++) {
-    const px = Math.round(x + i * cell + cell / 2);
-    const py = Math.round(y + cell / 2);
+    const px = Math.round(ox + x + i * cell + cell / 2);
+    const py = Math.round(oy + y + cell / 2);
     if (px < 0 || py < 0 || px >= img.width || py >= img.height) return null;
     const o = (py * img.width + px) * 4;
     const luma = (img.data[o] * 0.299 + img.data[o + 1] * 0.587 + img.data[o + 2] * 0.114) / 255;
@@ -111,8 +122,7 @@ export function sheetTiles(img: PixelSource): PixelSource[] | null {
     const th = img.height / rows;
     if (tw < 200 || th < 200) continue;
 
-    const first = cropTile(img, 0, 0, tw, th);
-    const header = readFrameHeader(first);
+    const header = readHeaderAt(img, 0, 0, tw, th);
     if (!header || header.k !== 0 || header.n !== n) continue;
 
     const tiles: PixelSource[] = [];

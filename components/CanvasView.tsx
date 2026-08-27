@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef } from "react";
+import { useCallback, useEffect, useRef } from "react";
 import { drawChromograph, type RenderParams } from "@/lib/render";
 import type { Preset } from "@/lib/palette";
 
@@ -15,9 +15,8 @@ type Props = {
 /** Static render: nothing here animates, so it paints on change and then stops. */
 export default function CanvasView({ text, params, preset, onResize }: Props) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const paintRef = useRef<() => void>(() => {});
 
-  paintRef.current = () => {
+  const paint = useCallback(() => {
     const canvas = canvasRef.current;
     const ctx = canvas?.getContext("2d");
     if (!canvas || !ctx) return;
@@ -30,19 +29,19 @@ export default function CanvasView({ text, params, preset, onResize }: Props) {
       onResize?.(canvas.clientWidth, canvas.clientHeight);
     }
     drawChromograph(ctx, { text, params, preset, width: w, height: h });
-  };
+  }, [text, params, preset, onResize]);
 
   useEffect(() => {
-    paintRef.current();
-  });
+    paint();
+  }, [paint]);
 
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
-    const observer = new ResizeObserver(() => paintRef.current());
+    const observer = new ResizeObserver(paint);
     observer.observe(canvas);
     return () => observer.disconnect();
-  }, []);
+  }, [paint]);
 
-  return <canvas ref={canvasRef} className="block h-full w-full" />;
+  return <canvas ref={canvasRef} className="block h-full w-full" aria-label="Chromograph render" />;
 }

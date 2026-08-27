@@ -22,7 +22,7 @@
  * from the image dimensions alone, via plotRect / isoRect.
  */
 
-import { CELL_PITCH, CHARSET, OFFSET_R, cellCenter, nearestCell, MAX_CHARS, type Point } from "./grid.ts";
+import { CELL_PITCH, CHARSET, OFFSET_R, nearestCell, MAX_CHARS, type Point } from "./grid.ts";
 import { HUE_SPAN, HUE_START, rgbToHsv } from "./palette.ts";
 import { plotRect } from "./render.ts";
 import { fromPx, isoRect, yawOf, zOf, type IsoRect } from "./iso.ts";

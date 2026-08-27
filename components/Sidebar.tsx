@@ -1,6 +1,7 @@
 "use client";
 
 import { MAX_CHARS, STILL_RELIABLE_CHARS, type Sanitised } from "@/lib/grid";
+import Notice from "./Notice";
 import { PRESETS, type Preset } from "@/lib/palette";
 import type { RenderParams, ViewMode } from "@/lib/render";
 
@@ -17,7 +18,7 @@ type Props = {
   onExportAnimation: () => void;
   onExportSheet: () => void;
   onExportGif: () => void;
-  recording: boolean;
+  busy: boolean;
   onExportFourier: () => void;
   onCopyDesmos: () => void;
   equationNote: string | null;
@@ -71,6 +72,7 @@ export default function Sidebar(p: Props) {
               key={id}
               onClick={() => set("mode")(id)}
               data-pressed={p.params.mode === id}
+              aria-pressed={p.params.mode === id}
               className="w-out w-btn flex-1"
             >
               {label}
@@ -98,6 +100,7 @@ export default function Sidebar(p: Props) {
               key={preset.id}
               onClick={() => p.setPresetId(preset.id)}
               data-pressed={preset.id === p.preset.id}
+              aria-pressed={preset.id === p.preset.id}
               className="w-out w-btn min-w-0 !px-1 text-left"
             >
               <span className="flex items-center gap-1.5">
@@ -153,13 +156,13 @@ export default function Sidebar(p: Props) {
           </button>
         </div>
         <div className="flex gap-[3px]">
-          <button onClick={p.onExportSheet} className="w-out w-btn flex-1 min-w-0">
+          <button onClick={p.onExportSheet} disabled={p.busy} className="w-out w-btn flex-1 min-w-0">
             Sheet PNG
           </button>
-          <button onClick={p.onExportGif} disabled={p.recording} className="w-out w-btn flex-1 min-w-0">
-            {p.recording ? "Working..." : "GIF"}
+          <button onClick={p.onExportGif} disabled={p.busy} className="w-out w-btn flex-1 min-w-0">
+            {p.busy ? "Working..." : "GIF"}
           </button>
-          <button onClick={p.onExportAnimation} disabled={p.recording} className="w-out w-btn flex-1 min-w-0">
+          <button onClick={p.onExportAnimation} disabled={p.busy} className="w-out w-btn flex-1 min-w-0">
             WebM
           </button>
         </div>
@@ -197,15 +200,6 @@ function Group({ label, children }: { label: string; children: React.ReactNode }
       <legend className="px-1 font-bold">{label}</legend>
       <div className="flex flex-col gap-1.5">{children}</div>
     </fieldset>
-  );
-}
-
-function Notice({ children }: { children: React.ReactNode }) {
-  return (
-    <p className="border border-[var(--dark)] bg-[#ffffe1] px-1.5 py-1">
-      <span className="font-bold">! </span>
-      {children}
-    </p>
   );
 }
 
