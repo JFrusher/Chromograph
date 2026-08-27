@@ -19,6 +19,8 @@ import { headerLayout, readFrameHeader, sheetCols, sheetRows, sheetTiles } from 
 import { buildLookup, buildPalette, decodeGif, encodeGif, lzwDecode, lzwEncode } from "./gif.ts";
 import { fromPx } from "./iso.ts";
 import { desmosText, fitFourier } from "./equation.ts";
+import { applyH, solveHomography } from "./homography.ts";
+import { SHOW, bandBits, parseBand, type Edge } from "./showframe.ts";
 
 // --- grid -------------------------------------------------------------------
 
@@ -546,4 +548,189 @@ test("the GIF palette can represent grey without a colour cast", () => {
     const spread = Math.max(r, g, b) - Math.min(r, g, b);
     assert.ok(spread === 0, `grey ${v} quantised to (${r},${g},${b})`);
   }
+});
+
+// --- homography -------------------------------------------------------------
+
+const UNIT: { x: number; y: number }[] = [
+  { x: -1, y: -1 },
+  { x: 1, y: -1 },
+  { x: 1, y: 1 },
+  { x: -1, y: 1 },
+];
+
+test("a homography maps each correspondence exactly onto its destination", () => {
+  // A quad with genuine perspective: no two sides parallel, so all eight
+  // unknowns are exercised. A square-to-square case would pass with h6/h7 wrong.
+  const quad = [
+    { x: -0.72, y: -0.61 },
+    { x: 0.83, y: -0.44 },
+    { x: 0.55, y: 0.79 },
+    { x: -0.48, y: 0.52 },
+  ];
+  const h = solveHomography(UNIT, quad);
+  assert.ok(h);
+  for (let i = 0; i < 4; i++) {
+    const got = applyH(h, UNIT[i]);
+    assert.ok(got);
+    assert.ok(Math.abs(got.x - quad[i].x) < 1e-9, `corner ${i} x: ${got.x} vs ${quad[i].x}`);
+    assert.ok(Math.abs(got.y - quad[i].y) < 1e-9, `corner ${i} y: ${got.y} vs ${quad[i].y}`);
+  }
+});
+
+test("solving the reverse correspondence inverts the transform", () => {
+  const quad = [
+    { x: -0.72, y: -0.61 },
+    { x: 0.83, y: -0.44 },
+    { x: 0.55, y: 0.79 },
+    { x: -0.48, y: 0.52 },
+  ];
+  const fwd = solveHomography(UNIT, quad);
+  const back = solveHomography(quad, UNIT);
+  assert.ok(fwd);
+  assert.ok(back);
+  // Interior points, not just the corners: the corners are pinned by
+  // construction, so only interior agreement tests the transform itself.
+  for (const p of [
+    { x: 0, y: 0 },
+    { x: 0.4, y: -0.3 },
+    { x: -0.9, y: 0.6 },
+    { x: 0.15, y: 0.85 },
+  ]) {
+    const there = applyH(fwd, p);
+    assert.ok(there);
+    const home = applyH(back, there);
+    assert.ok(home);
+    assert.ok(Math.abs(home.x - p.x) < 1e-9, `x roundtrip ${home.x} vs ${p.x}`);
+    assert.ok(Math.abs(home.y - p.y) < 1e-9, `y roundtrip ${home.y} vs ${p.y}`);
+  }
+});
+
+test("a homography is not fitted through a degenerate quad", () => {
+  const collinear = [
+    { x: -1, y: -1 },
+    { x: 0, y: 0 },
+    { x: 1, y: 1 },
+    { x: -1, y: 1 },
+  ];
+  assert.equal(solveHomography(collinear, UNIT), null);
+  assert.equal(solveHomography(UNIT, UNIT.slice(0, 3)), null);
+  // Two coincident source points carry no independent constraint.
+  const doubled = [{ x: -1, y: -1 }, { x: -1, y: -1 }, { x: 1, y: 1 }, { x: -1, y: 1 }];
+  assert.equal(solveHomography(doubled, UNIT), null);
+});
+
+test("an identity correspondence yields the identity transform", () => {
+  const h = solveHomography(UNIT, UNIT);
+  assert.ok(h);
+  for (const p of [{ x: 0.3, y: -0.7 }, { x: -0.2, y: 0.44 }]) {
+    const got = applyH(h, p);
+    assert.ok(got);
+    assert.ok(Math.abs(got.x - p.x) < 1e-9);
+    assert.ok(Math.abs(got.y - p.y) < 1e-9);
+  }
+});
+
+// --- show frame band ---------------------------------------------------------
+
+const EDGES: Edge[] = [0, 1, 2, 3];
+
+test("a band word roundtrips for every character index on every edge", () => {
+  const n = MAX_CHARS;
+  for (const edge of EDGES) {
+    for (let k = 0; k < n; k++) {
+      const got = parseBand(bandBits(k, n, edge), edge);
+      assert.deepEqual(got, { k, n }, "edge " + edge + " k " + k);
+    }
+  }
+  // Guards must stay clear whatever the payload, or a set cell can touch a
+  // fiducial and the two merge into one blob.
+  for (const k of [0, 1, 63, 119]) {
+    const bits = bandBits(k, MAX_CHARS, 0);
+    assert.equal(bits[0], 0);
+    assert.equal(bits[bits.length - 1], 0);
+  }
+});
+
+test("any single flipped cell in a band is rejected", () => {
+  const word = bandBits(37, 90, 2);
+  for (let i = 0; i < word.length; i++) {
+    const bad = word.slice();
+    bad[i] ^= 1;
+    assert.equal(parseBand(bad, 2), null, "flip at " + i + " was accepted");
+  }
+});
+
+test("a band read from the wrong edge is rejected", () => {
+  // This is the failure the edge id exists for. Under a 90 degree wrong
+  // orientation the reader traverses a different physical edge along that
+  // edge's own forward direction, so the word arrives undamaged: sync intact,
+  // CRC intact, k and n correct. Only the edge id disagrees -- and without it
+  // the frame would decode a marker out of a rotated warp to a wrong character.
+  for (const wrote of EDGES) {
+    for (const reads of EDGES) {
+      const got = parseBand(bandBits(11, 40, wrote), reads);
+      if (wrote === reads) assert.deepEqual(got, { k: 11, n: 40 });
+      else assert.equal(got, null, "edge " + wrote + " accepted as " + reads);
+    }
+  }
+});
+
+test("a band read backwards is rejected", () => {
+  // A 180 degree wrong orientation reverses every band.
+  for (const edge of EDGES) {
+    const backwards = bandBits(11, 40, edge).slice().reverse();
+    for (const reads of EDGES) {
+      assert.equal(parseBand(backwards, reads), null, "reversed edge " + edge);
+    }
+  }
+});
+
+test("an out-of-range band is rejected even when its CRC agrees", () => {
+  // A word can be internally consistent and still be nonsense. k must index a
+  // character that exists, or the accumulator is handed an index it cannot use.
+  assert.equal(parseBand(bandBits(5, 5, 0), 0), null); // k == n
+  assert.equal(parseBand(bandBits(9, 3, 0), 0), null); // k  > n
+  assert.equal(parseBand(bandBits(0, 0, 0), 0), null); // empty message
+  assert.equal(parseBand(bandBits(0, MAX_CHARS + 1, 0), 0), null);
+  assert.deepEqual(parseBand(bandBits(0, 1, 0), 0), { k: 0, n: 1 });
+});
+
+test("the show frame furniture never overlaps the artwork", () => {
+  const { inner, total, fid, cells } = SHOW;
+
+  // The artwork sits strictly inside the composition.
+  assert.ok(total.x < inner.x && total.y < inner.y);
+  assert.ok(total.x + total.w > inner.x + inner.w);
+  assert.ok(total.y + total.h > inner.y + inner.h);
+
+  const overlapsInner = (x: number, y: number, w: number, h: number) =>
+    x < inner.x + inner.w && x + w > inner.x && y < inner.y + inner.h && y + h > inner.y;
+
+  for (const f of fid) {
+    const s = SHOW.fidSize;
+    assert.ok(!overlapsInner(f.x - s / 2, f.y - s / 2, s, s), "fiducial over artwork");
+    // And inside the quiet zone, so the blob finder sees background all round.
+    assert.ok(f.x - s / 2 > total.x && f.x + s / 2 < total.x + total.w);
+    assert.ok(f.y - s / 2 > total.y && f.y + s / 2 < total.y + total.h);
+  }
+
+  for (const edge of EDGES) {
+    const { w, h } = SHOW.cellSize(edge);
+    for (let i = 0; i < cells; i++) {
+      const c = SHOW.cellCentre(edge, i);
+      assert.ok(!overlapsInner(c.x - w / 2, c.y - h / 2, w, h), "band cell over artwork");
+      assert.ok(c.x > total.x && c.x < total.x + total.w, "band cell outside frame");
+      assert.ok(c.y > total.y && c.y < total.y + total.h, "band cell outside frame");
+    }
+  }
+
+  // Fiducial centres form a rectangle, and a distinctly non-square one so a
+  // transposed orientation guess is visibly wrong before any cell is read.
+  assert.equal(fid[0].y, fid[1].y);
+  assert.equal(fid[2].y, fid[3].y);
+  assert.equal(fid[0].x, fid[3].x);
+  assert.equal(fid[1].x, fid[2].x);
+  const ratio = (fid[1].x - fid[0].x) / (fid[3].y - fid[0].y);
+  assert.ok(ratio > 1.2 && ratio < 1.5, "fiducial aspect " + ratio);
 });
