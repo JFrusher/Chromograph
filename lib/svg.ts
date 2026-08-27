@@ -141,7 +141,7 @@ const square = (p: Point, s: number, fill: string) =>
   `<rect x="${n2(p.x - s)}" y="${n2(p.y - s)}" width="${n2(s * 2)}" height="${n2(s * 2)}" fill="${fill}"/>`;
 
 function bar(o: SvgOptions, rect: { x: number; y: number; w: number; h: number }, n: number, scale: number): string[] {
-  if (!o.params.showBar || !o.preset.decodable || n < 2) return [];
+  if (!o.params.showBar || !o.preset.hueOrdered || n < 2) return [];
   const out: string[] = [];
   const w = rect.w / n;
   for (let k = 0; k < n; k++) {

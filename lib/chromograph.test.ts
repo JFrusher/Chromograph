@@ -383,9 +383,10 @@ function rasteriseFrames(text: string, W: number, H: number, drop: number[] = []
       }
     };
 
+    // Achromatic marker: white here, since the fixture's background is dark.
     const at = isoToPx({ x: knots[k].x, y: knots[k].y, z: zOf(k, n) }, r, yawOf(k, n));
     const s = 12;
-    fill(at.x - s, at.y - s, s * 2, s * 2, hslToRgb(330, 1, 0.5));
+    fill(at.x - s, at.y - s, s * 2, s * 2, [255, 255, 255]);
 
     const lay = headerLayout(W, H);
     fill(lay.x - lay.cell, lay.y - lay.cell, (lay.cells + 2) * lay.cell, 3 * lay.cell, [0, 0, 0]);
@@ -499,7 +500,7 @@ test("LZW survives a roundtrip, including runs that exercise the dictionary", ()
 
 test("a GIF roundtrips through its own encoder and decoder", () => {
   const frames = rasteriseFrames("GIF", 480, 480);
-  const palette = buildPalette([5, 3, 15], [255, 0, 128]);
+  const palette = buildPalette([5, 3, 15]);
   const lut = buildLookup(palette);
   const bytes = encodeGif({ frames, palette, lut, delay: 10 });
 
@@ -514,7 +515,7 @@ test("a GIF roundtrips through its own encoder and decoder", () => {
 test("a Chromograph GIF decodes back to its message", () => {
   const text = "GIF ROUNDTRIP, YES?";
   const frames = rasteriseFrames(text, 560, 560);
-  const palette = buildPalette([5, 3, 15], [255, 0, 128]);
+  const palette = buildPalette([5, 3, 15]);
   const lut = buildLookup(palette);
   const bytes = encodeGif({ frames, palette, lut, delay: 10 });
 
@@ -523,14 +524,26 @@ test("a Chromograph GIF decodes back to its message", () => {
   assert.equal(out.text, text);
 });
 
-test("quantisation keeps the marker and the header plate exact", () => {
-  const palette = buildPalette([5, 3, 15], [255, 0, 128]);
+test("quantisation keeps black, white and the background exact", () => {
+  const palette = buildPalette([5, 3, 15]);
   const lut = buildLookup(palette);
   const probe = (r: number, g: number, b: number) => {
     const i = lut[((r >> 3) << 10) | ((g >> 3) << 5) | (b >> 3)];
     return [palette[i * 3], palette[i * 3 + 1], palette[i * 3 + 2]];
   };
+  // Black and white carry the header plate and the marker, so both must be exact.
   assert.deepEqual(probe(0, 0, 0), [0, 0, 0]);
   assert.deepEqual(probe(255, 255, 255), [255, 255, 255]);
-  assert.deepEqual(probe(255, 0, 128), [255, 0, 128]);
+  assert.deepEqual(probe(5, 3, 15), [5, 3, 15]);
+});
+
+test("the GIF palette can represent grey without a colour cast", () => {
+  const palette = buildPalette([255, 255, 255]);
+  const lut = buildLookup(palette);
+  for (const v of [32, 64, 96, 128, 160, 192, 224]) {
+    const i = lut[((v >> 3) << 10) | ((v >> 3) << 5) | (v >> 3)];
+    const [r, g, b] = [palette[i * 3], palette[i * 3 + 1], palette[i * 3 + 2]];
+    const spread = Math.max(r, g, b) - Math.min(r, g, b);
+    assert.ok(spread === 0, `grey ${v} quantised to (${r},${g},${b})`);
+  }
 });

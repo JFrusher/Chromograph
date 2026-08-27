@@ -1,30 +1,32 @@
 /**
- * Image -> text. Two decoders, tried in order.
+ * Image -> text. Three readers, for the three shapes a Chromograph comes in.
  *
- * ISOMETRIC (geometric). Each character drops a stem from its knot to the base
- * plane. The z axis projects to pure screen-vertical, so a stem is an exactly
- * vertical line whose foot unprojects to a grid cell -- the character -- and
- * whose length encodes where it sits in the message. Sorting the stems by length
- * recovers the order outright, with no absolute calibration and immune to any
- * constant bias in how the lengths are measured. Colour is only a cross-check
- * here, which is the point: geometry survives recompression and rescaling that
- * destroy hue.
+ * FRAMES (`decodeFrames`, exact). Every frame carries a header stating which
+ * character it is and how many there are. From k follow both the marked knot's
+ * height and the camera angle, and with those known the projection inverts, so
+ * the marker's position gives the grid cell outright. Nothing analog is
+ * measured, and no colour is read: the header is black and white, and so is the
+ * marker. Frames are independent, so they may arrive in any order, be
+ * duplicated, or go missing.
  *
- * FLAT (photometric). No stems, so order has to come from colour. Hue advances
- * uniformly per character step (see palette.hueAt): with N characters, knot k
- * sits at exactly hue k * HUE_SPAN / (N - 1), so the decoder samples the curve
- * at N specific hues and ignores everything between them. N comes from the
- * calibration bar, or is fitted if the bar is missing.
+ * ISOMETRIC STILL (`decodeIso`, best effort). One frame has no index, so order
+ * has to come from hue: it advances uniformly per character step (see
+ * palette.hueAt), and the calibration bar gives N. Position is still exact --
+ * knot k's height follows from k, and that makes the projection invertible.
  *
- * Both assume an uncropped export -- the scene's placement is derived from the
- * image dimensions alone, via plotRect / isoRect.
+ * FLAT STILL (`decodeFlat`, best effort). Hue for the order as above, and the
+ * grid read straight off the image plane. N comes from the calibration bar, or
+ * is fitted when the bar is missing.
+ *
+ * Every reader assumes an uncropped export: the scene's placement is derived
+ * from the image dimensions alone, via plotRect / isoRect.
  */
 
 import { CELL_PITCH, CHARSET, OFFSET_R, cellCenter, nearestCell, MAX_CHARS, type Point } from "./grid.ts";
 import { HUE_SPAN, HUE_START, rgbToHsv } from "./palette.ts";
 import { plotRect } from "./render.ts";
 import { fromPx, isoRect, yawOf, zOf, type IsoRect } from "./iso.ts";
-import { readFrameHeader } from "./frame.ts";
+import { headerLayout, readFrameHeader } from "./frame.ts";
 
 export type ImageDataLike = {
   width: number;
@@ -46,12 +48,10 @@ export type DecodeResult = {
   chars: DecodedChar[];
   knotCount: number;
   mode: "iso" | "flat" | "frames";
-  source: "frame-index" | "stem-geometry" | "calibration-bar" | "fit";
+  source: "frame-index" | "calibration-bar" | "fit";
   warnings: string[];
-  /** Image-pixel positions of the traced hue ramp, for the debug overlay. */
+  /** Image-pixel positions of the traced hue ramp, for the debug overlay. Stills only. */
   trace: Point[];
-  /** Detected stems, for the debug overlay. */
-  stems: { foot: Point; top: Point }[];
   maskedPixels: number;
 };
 
@@ -133,7 +133,6 @@ function decodeFlat(img: ImageDataLike): DecodeResult {
         "No saturated curve found. Is this a Chromograph export? The Grayscale palette carries no hue and cannot be decoded.",
       ],
       trace,
-      stems: [],
       maskedPixels: bins.masked,
     };
   }
@@ -177,7 +176,6 @@ function decodeFlat(img: ImageDataLike): DecodeResult {
     source,
     warnings,
     trace,
-    stems: [],
     maskedPixels: bins.masked,
   };
 }
@@ -323,7 +321,7 @@ function fitKnotCount(bins: Bins, r: Rect): { count: number; meanDist: number } 
  * The bar is one flat swatch per character. Counting the swatches gives N, and
  * their hues confirm the ramp survived whatever the image has been through.
  */
-export function readCalibrationBar(
+function readCalibrationBar(
   img: ImageDataLike,
   bar: { x: number; y: number; w: number; h: number },
 ): { count: number; deviation: number } | null {
@@ -386,8 +384,6 @@ export function gridToImage(p: Point, W: number, H: number): Point {
   return { x: r.x + p.x * r.w, y: r.y + p.y * r.h };
 }
 
-export { cellCenter };
-
 // --- isometric still -------------------------------------------------------
 
 /**
@@ -431,7 +427,6 @@ function decodeIso(img: ImageDataLike): DecodeResult | null {
     source: "calibration-bar",
     warnings,
     trace: binTrace(bins),
-    stems: [],
     maskedPixels: bins.masked,
   };
 }
@@ -463,9 +458,13 @@ const misfit = (out: DecodeResult) =>
 
 // --- animated: frame index as the channel ------------------------------------
 
-/** Marker pixels: the reserved hue, at full chroma. */
-/** Widened for lossy video: chroma subsampling shifts hue a few degrees. */
-const MASK_MARKER = { hue: 330, tol: 14, s: 0.6, v: 0.35 };
+/**
+ * The marker is achromatic: whichever of black or white the background is not.
+ * So it is found by luminance, and a frame needs to carry no colour at all.
+ */
+const MARKER_LUMA_TOL = 0.06;
+/** Anything this saturated is scene, not marker, however bright it happens to be. */
+const MARKER_MAX_SAT = 0.25;
 /** Fewer marker pixels than this and it is a compression artifact, not the square. */
 const MIN_MARKER_PIXELS = 40;
 
@@ -521,7 +520,6 @@ export function decodeFrames(frames: ImageDataLike[]): DecodeResult {
       source: "frame-index",
       warnings: ["No frame headers found. Is this a Chromograph animation?"],
       trace: [],
-      stems: [],
       maskedPixels: 0,
     };
   }
@@ -549,23 +547,46 @@ export function decodeFrames(frames: ImageDataLike[]): DecodeResult {
     source: "frame-index",
     warnings,
     trace: [],
-    stems: [],
     maskedPixels: found.size,
   };
 }
 
-/** Median position of the marker's pixels; median so stray artifacts cannot pull it. */
+const luma = (r: number, g: number, b: number) => (r * 0.299 + g * 0.587 + b * 0.114) / 255;
+
+/**
+ * Median position of the marker's pixels; median so stray artifacts cannot pull
+ * it off the square.
+ *
+ * The background is read from the corners, and the marker is whichever luminance
+ * extreme the background is not. The header plate is the one other thing on the
+ * frame at a pure extreme, and it sits at a known position, so it is excluded by
+ * geometry rather than by hoping it looks different.
+ */
 function markerAt(img: ImageDataLike): Point | null {
   const { width: W, height: H, data } = img;
+  const at = (x: number, y: number) => {
+    const i = (y * W + x) * 4;
+    return luma(data[i], data[i + 1], data[i + 2]);
+  };
+  const corners = [at(1, 1), at(W - 2, 1), at(1, H - 2), at(W - 2, H - 2)].sort((a, b) => a - b);
+  const target = (corners[1] + corners[2]) / 2 > 0.5 ? 0 : 1;
+
+  const plate = headerLayout(W, H);
+  const px0 = plate.x - 2 * plate.cell;
+  const px1 = plate.x + (plate.cells + 3) * plate.cell;
+  const py0 = plate.y - 2 * plate.cell;
+  const py1 = plate.y + 3 * plate.cell;
+
   const xs: number[] = [];
   const ys: number[] = [];
   for (let y = 0; y < H; y++) {
+    const inPlateRow = y >= py0 && y <= py1;
     for (let x = 0; x < W; x++) {
+      if (inPlateRow && x >= px0 && x <= px1) continue;
       const i = (y * W + x) * 4;
       if (data[i + 3] < 128) continue;
-      const { h, s, v } = rgbToHsv(data[i], data[i + 1], data[i + 2]);
-      if (Math.abs(h - MASK_MARKER.hue) > MASK_MARKER.tol) continue;
-      if (s < MASK_MARKER.s || v < MASK_MARKER.v) continue;
+      if (Math.abs(luma(data[i], data[i + 1], data[i + 2]) - target) > MARKER_LUMA_TOL) continue;
+      if (rgbToHsv(data[i], data[i + 1], data[i + 2]).s > MARKER_MAX_SAT) continue;
       xs.push(x);
       ys.push(y);
     }

@@ -2,7 +2,7 @@
 
 import { CELLS, COLS, ROWS, cellCenter, textToKnots, type Point } from "./grid.ts";
 import { catmullRom } from "./spline.ts";
-import { colorFor, contrastInk, hueAt, stemColorFor, type Preset } from "./palette.ts";
+import { colorFor, contrastInk, hueAt, markerInk, stemColorFor, type Preset } from "./palette.ts";
 import { isoRect, toPx as isoPx, yawOf, zOf, type IsoRect } from "./iso.ts";
 import { drawFrameHeader, type FrameHeader } from "./frame.ts";
 
@@ -22,10 +22,7 @@ export type RenderParams = {
   thickness: number;
   gridOpacity: number;
   showBar: boolean;
-  /**
-   * Isometric only. Stems are what make the image decodable from geometry alone;
-   * turning them off leaves hue as the only channel, exactly as in flat mode.
-   */
+  /** Isometric only. Drop lines from each knot to the base plane, for the eye. */
   stems: boolean;
 };
 
@@ -113,7 +110,7 @@ function drawFlat(ctx: CanvasRenderingContext2D, o: DrawOptions) {
     ctx.fillRect(p.x - s, p.y - s, s * 2, s * 2);
   }
 
-  if (params.showBar && preset.decodable) drawCalibrationBar(ctx, r.bar, knots.length, scale);
+  if (params.showBar && preset.hueOrdered) drawCalibrationBar(ctx, r.bar, knots.length, scale);
 }
 
 /** Grid marks are crosses rather than dots -- a plotter tick, not a soft point. */
@@ -181,7 +178,7 @@ function drawIso(ctx: CanvasRenderingContext2D, o: DrawOptions) {
   if (frame) {
     // Animated frames carry no stems: the marker owns the reserved hue range,
     // and the frame header already states which character this is.
-    drawMarker(ctx, knots, frame, r, scale, params.thickness, yaw);
+    drawMarker(ctx, knots, frame, r, scale, params.thickness, yaw, preset);
     drawFrameHeader(ctx, W, H, frame);
     return;
   }
@@ -191,21 +188,15 @@ function drawIso(ctx: CanvasRenderingContext2D, o: DrawOptions) {
   // two extra characters.
   if (params.stems) drawStems(ctx, knots, n, preset, r, scale, params.thickness);
 
-  if (params.showBar && preset.decodable) drawCalibrationBar(ctx, r.bar, n, scale);
+  if (params.showBar && preset.hueOrdered) drawCalibrationBar(ctx, r.bar, n, scale);
 }
-
-/**
- * Colour reserved for the frame marker: hsl(330, 100%, 50%), clear of the
- * payload ramp (0..300). Held as RGB so the GIF palette can hold it exactly.
- */
-export const MARKER_RGB: [number, number, number] = [255, 0, 128];
-const MARKER_CSS = `rgb(${MARKER_RGB.join(",")})`;
 
 /**
  * Highlights the one knot this frame is about, with a drop line to the base so
  * the eye can place it. Position plus the frame's own k is everything the
  * decoder needs: k gives the knot's height and the camera angle, and those make
- * the projection invertible.
+ * the projection invertible. Drawn in black or white, so a frame needs no colour
+ * at all -- see palette.markerInk.
  */
 function drawMarker(
   ctx: CanvasRenderingContext2D,
@@ -215,16 +206,18 @@ function drawMarker(
   scale: number,
   thickness: number,
   yaw: number,
+  preset: Preset,
 ) {
   const knot = knots[Math.min(frame.k, knots.length - 1)];
   const z = zOf(frame.k, knots.length);
   const at = isoPx({ x: knot.x, y: knot.y, z }, r, yaw);
   const foot = isoPx({ x: knot.x, y: knot.y, z: 0 }, r, yaw);
 
-  // Desaturated: the decoder takes the median of fully saturated marker pixels,
-  // and a long drop line at full chroma would drag that median down towards the
-  // base plane instead of leaving it on the square.
-  ctx.strokeStyle = "hsl(330, 40%, 45%)";
+  // Mid grey, well away from both extremes: the decoder takes the median of the
+  // marker's pixels, and a drop line sharing its tone would drag that median
+  // down towards the base plane instead of leaving it on the square.
+  const ink = markerInk(preset.bg);
+  ctx.strokeStyle = "rgb(128,128,128)";
   ctx.lineWidth = Math.max(1, thickness * scale * 0.35);
   ctx.beginPath();
   ctx.moveTo(at.x, at.y);
@@ -234,7 +227,7 @@ function drawMarker(
   // Floor of 6px: GIF frames are small, and the decoder needs enough marker
   // pixels left after quantisation to take a stable median.
   const s = Math.max(6, thickness * scale * 1.6);
-  ctx.fillStyle = MARKER_CSS;
+  ctx.fillStyle = `rgb(${ink.join(",")})`;
   ctx.fillRect(at.x - s, at.y - s, s * 2, s * 2);
 }
 

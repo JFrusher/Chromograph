@@ -28,8 +28,12 @@ export type Preset = {
   bg: string;
   sat: number;
   light: number;
-  /** False when the preset carries no hue, so order cannot be recovered from it. */
-  decodable: boolean;
+  /**
+   * Whether hue carries the character order. False means stills cannot be
+   * decoded from this palette -- frame formats still can, since their order
+   * comes from the header rather than from colour.
+   */
+  hueOrdered: boolean;
 };
 
 /**
@@ -39,21 +43,23 @@ export type Preset = {
  * black and white have no hue to leak.
  */
 export const PRESETS: Preset[] = [
-  { id: "black", name: "Black", bg: "#000000", sat: 100, light: 55, decodable: true },
-  { id: "silver", name: "Silver", bg: "#c0c0c0", sat: 100, light: 35, decodable: true },
-  { id: "paper", name: "Paper", bg: "#ffffff", sat: 100, light: 42, decodable: true },
-  { id: "gray", name: "Grayscale", bg: "#ffffff", sat: 0, light: 30, decodable: false },
+  { id: "black", name: "Black", bg: "#000000", sat: 100, light: 55, hueOrdered: true },
+  { id: "silver", name: "Silver", bg: "#c0c0c0", sat: 100, light: 35, hueOrdered: true },
+  { id: "paper", name: "Paper", bg: "#ffffff", sat: 100, light: 42, hueOrdered: true },
+  { id: "gray", name: "Grayscale", bg: "#ffffff", sat: 0, light: 30, hueOrdered: false },
 ];
 
 export const presetById = (id: string): Preset => PRESETS.find((p) => p.id === id) ?? PRESETS[0];
 
 /** Colour at a fractional knot index. */
 export function colorFor(seg: number, knotCount: number, preset: Preset): string {
-  if (!preset.decodable) {
+  if (!preset.hueOrdered) {
     // No hue to encode direction with, so ramp lightness instead. Still readable
     // by eye as a direction cue; still not machine-decodable.
+    // Held clear of both extremes: pure black and pure white are reserved for
+    // the frame marker and its header plate.
     const t = knotCount < 2 ? 0 : seg / (knotCount - 1);
-    return `hsl(0, 0%, ${(72 - t * 72).toFixed(1)}%)`;
+    return `hsl(0, 0%, ${(70 - t * 55).toFixed(1)}%)`;
   }
   return `hsl(${hueAt(seg, knotCount).toFixed(2)}, ${preset.sat}%, ${preset.light}%)`;
 }
@@ -62,26 +68,36 @@ export function colorFor(seg: number, knotCount: number, preset: Preset): string
  * Stems live in a hue range the payload never uses: 305..355, just past the
  * ramp's magenta end.
  *
- * Brightness cannot separate them from the curve, which is the trap. An
- * antialiased curve edge fading into the background is that colour multiplied
- * by coverage, and multiplying RGB by a scalar leaves hue and saturation alone
- * while sweeping value continuously from 1 to 0 -- straight through any band
- * you might reserve. Hue is the one channel antialiasing against a neutral
- * background does not move.
- *
- * The range still varies with k, so two stems that overlap on screen usually
- * differ enough in hue for the decoder to cut them apart.
+ * Load-bearing, despite stems being decoration. A still is read by binning
+ * curve pixels by hue, and that binning accepts only 0..300 -- so keeping stems
+ * outside the ramp is what stops them being mistaken for curve and dragging a
+ * bin's position. Varying the hue across the message is purely cosmetic: it
+ * makes the stems echo the curve above them.
  */
-export const STEM_HUE_START = 305;
-export const STEM_HUE_SPAN = 50;
+const STEM_HUE_START = 305;
+const STEM_HUE_SPAN = 50;
 
 export const stemHue = (k: number, knotCount: number) =>
   knotCount < 2 ? STEM_HUE_START : STEM_HUE_START + (k / (knotCount - 1)) * STEM_HUE_SPAN;
 
 /** Colour of the stem dropped from knot k. */
 export function stemColorFor(k: number, knotCount: number, preset: Preset): string {
-  if (!preset.decodable) return "hsl(0, 0%, 45%)";
+  if (!preset.hueOrdered) return "hsl(0, 0%, 45%)";
   return `hsl(${stemHue(k, knotCount).toFixed(2)}, 100%, 50%)`;
+}
+
+/**
+ * The frame marker's colour: whichever of black or white the background is not.
+ *
+ * Achromatic on purpose. It means a frame carries no colour information at all
+ * -- the header plate is black and white, the marker is black or white, and the
+ * order comes from the header rather than from hue. Any palette then decodes,
+ * greyscale included, and luminance survives compression better than chroma
+ * does anyway.
+ */
+export function markerInk(bg: string): [number, number, number] {
+  const [r, g, b] = hexToRgb(bg);
+  return (r * 0.299 + g * 0.587 + b * 0.114) / 255 > 0.5 ? [0, 0, 0] : [255, 255, 255];
 }
 
 export function hexToRgb(hex: string): [number, number, number] {

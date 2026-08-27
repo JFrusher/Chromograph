@@ -22,25 +22,33 @@ const EOI = 257;
 // --- palette -----------------------------------------------------------------
 
 /**
- * Four colours that must survive quantisation exactly -- the header's black and
- * white, the marker, and the background -- plus a 6x6x7 cube for everything
- * else, which only has to look right.
+ * Colours that must survive quantisation exactly: black and white -- which carry
+ * the header plate and the marker both -- and the background.
+ *
+ * The rest is a 6x6x6 cube plus a grey ramp. The cube is deliberately equal on
+ * all three axes: give blue a different number of levels and no mid grey is
+ * representable at all, so every grey picks up a colour cast -- which is
+ * conspicuous on a greyscale palette, where the whole image is greys.
  */
-export function buildPalette(bg: [number, number, number], marker: [number, number, number]): Uint8Array {
+export function buildPalette(bg: [number, number, number]): Uint8Array {
   const pal = new Uint8Array(768);
   const put = (i: number, c: [number, number, number]) => pal.set(c, i * 3);
   put(0, [0, 0, 0]);
   put(1, [255, 255, 255]);
-  put(2, marker);
-  put(3, bg);
+  put(2, bg);
 
-  let i = 4;
+  let i = 3;
+  const level = (v: number) => Math.round((v * 255) / 5);
   for (let r = 0; r < 6; r++) {
     for (let g = 0; g < 6; g++) {
-      for (let b = 0; b < 7; b++) {
-        put(i++, [Math.round((r * 255) / 5), Math.round((g * 255) / 5), Math.round((b * 255) / 6)]);
-      }
+      for (let b = 0; b < 6; b++) put(i++, [level(r), level(g), level(b)]);
     }
+  }
+  // Remaining slots go to a finer grey ramp, between the cube's coarse steps.
+  const greys = 256 - i;
+  for (let n = 0; n < greys; n++) {
+    const v = Math.round(((n + 1) * 255) / (greys + 1));
+    put(i++, [v, v, v]);
   }
   return pal;
 }
@@ -72,15 +80,25 @@ export function buildLookup(pal: Uint8Array): Uint8Array {
     }
     lut[bucket] = best;
   }
+
+  // The first three entries carry the header plate, the marker and the
+  // background, and the decode reads all three by exact value. Nearest-neighbour
+  // does not guarantee them -- a fine grey ramp sits closer to the centre of the
+  // near-black bucket than pure black does -- so pin those buckets outright.
+  for (const i of [0, 1, 2]) {
+    lut[bucketOf(pal[i * 3], pal[i * 3 + 1], pal[i * 3 + 2])] = i;
+  }
   return lut;
 }
 
-export function quantise(frame: Frame, lut: Uint8Array): Uint8Array {
+const bucketOf = (r: number, g: number, b: number) => ((r >> 3) << 10) | ((g >> 3) << 5) | (b >> 3);
+
+function quantise(frame: Frame, lut: Uint8Array): Uint8Array {
   const n = frame.width * frame.height;
   const out = new Uint8Array(n);
   for (let p = 0; p < n; p++) {
     const o = p * 4;
-    out[p] = lut[((frame.data[o] >> 3) << 10) | ((frame.data[o + 1] >> 3) << 5) | (frame.data[o + 2] >> 3)];
+    out[p] = lut[bucketOf(frame.data[o], frame.data[o + 1], frame.data[o + 2])];
   }
   return out;
 }

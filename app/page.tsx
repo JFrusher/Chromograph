@@ -6,7 +6,7 @@ import Decoder from "@/components/Decoder";
 import Sidebar from "@/components/Sidebar";
 import { sanitize, STILL_RELIABLE_CHARS } from "@/lib/grid";
 import { hexToRgb, presetById } from "@/lib/palette";
-import { DEFAULT_PARAMS, drawChromograph, MARKER_RGB, type RenderParams } from "@/lib/render";
+import { DEFAULT_PARAMS, drawChromograph, type RenderParams } from "@/lib/render";
 import { toSVG } from "@/lib/svg";
 import { desmosText, fitFourier, fourierText } from "@/lib/equation";
 import { ANIM_FPS, animationSupported, recordAnimation } from "@/lib/anim";
@@ -174,7 +174,7 @@ export default function Page() {
         const frame = renderFrame(k, n, width, height);
         if (frame) frames.push(frame);
       }
-      const palette = buildPalette(hexToRgb(preset.bg), MARKER_RGB);
+      const palette = buildPalette(hexToRgb(preset.bg));
       const bytes = encodeGif({ frames, palette, lut: buildLookup(palette), delay: GIF_DELAY_CS });
       download(`${slug(clean.text)}.gif`, new Blob([bytes], { type: "image/gif" }));
       setEquationNote(`${n} frames, ${(bytes.length / 1e6).toFixed(1)} MB. This decodes exactly.`);
@@ -315,11 +315,9 @@ export default function Page() {
           <StatusCell>{preset.name}</StatusCell>
           <StatusCell>{params.mode === "iso" ? "Isometric" : "Flat"}</StatusCell>
           <StatusCell>
-            {!preset.decodable
-              ? "Art only"
-              : clean.text.length > STILL_RELIABLE_CHARS
-                ? "Sheet or WebM only"
-                : "Still: colour"}
+            {!preset.hueOrdered || clean.text.length > STILL_RELIABLE_CHARS
+              ? "Frames only"
+              : "Still or frames"}
           </StatusCell>
         </div>
       </div>

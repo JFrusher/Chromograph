@@ -29,7 +29,7 @@ Two things then say *where in the message* a knot sits:
 Hue runs 0°–300° rather than a full 360°, so red never appears at both ends and the direction
 of the message is never ambiguous.
 
-## Five formats, and what each can actually promise
+## Formats, and what each can actually promise
 
 |  | Order comes from | Exact? | Measured |
 |---|---|---|---|
@@ -37,7 +37,11 @@ of the message is never ambiguous.
 | **Sheet PNG** | frame index | yes | 120 characters, zero errors |
 | **WebM** | frame index | yes | unverified — needs a browser video encoder |
 | **PNG / SVG still** | hue | best effort | reliable to ~60 characters |
-| **Grayscale palette** | nothing | not decodable | art only |
+
+Colour is optional. A frame's order comes from its header, and the header plate and the marker
+are both black and white, so a greyscale export decodes exactly like any other — verified on a
+Grayscale GIF whose 11.2 million pixels contain **no saturated pixel at all**. Only stills need
+hue, because a still has no frame index to read instead.
 
 ### GIF, sheet and WebM: the frame index *is* the channel
 
@@ -51,13 +55,22 @@ height and angle known the axonometric projection inverts exactly, so the marker
 gives the grid cell outright. Frames are therefore fully independent. They can arrive out of
 order, be duplicated, or go missing; a lost frame costs exactly one character and says so.
 
+The marker is achromatic — whichever of black or white the background is not — and is found by
+luminance, with the header plate excluded by its known position rather than by hoping it looks
+different. That is deliberate on two counts: it leaves frames carrying no colour information
+whatsoever, and luminance survives compression better than chroma does.
+
 **GIF** is the rotating one, and the format to reach for. `lib/gif.ts` is a GIF89a encoder and
 decoder written out by hand, no dependency, so neither direction needs anything from the
 browser and the whole path is testable in Node. GIF is 8-bit, so frames are quantised to 256
 colours — which costs nothing here, because the decode reads a black-and-white header plate
 and the position of one saturated square, and the palette is built to hold both exactly.
 Quantisation goes through a 32768-entry nearest-colour table so it stays one array read per
-pixel rather than 256 comparisons.
+pixel rather than 256 comparisons. The cube is equal on all three axes on purpose: give blue a
+different number of levels and no mid grey is representable, so every grey picks up a colour
+cast — conspicuous on a greyscale palette, where the whole image is greys. Black, white and the
+background have their buckets pinned outright, since nearest-neighbour does not guarantee them
+and the decode reads all three by exact value.
 
 **Sheet PNG** is the same frames tiled into one lossless image. Largest files, but nothing can
 go wrong reading it.
@@ -81,6 +94,7 @@ rather than approximated.
   edge of every stroke, and those blends land in the hue bin belonging to a real character.
   Black, silver and white have no hue to leak — which is why there is no navy palette, even
   though the UI chrome is navy.
+- **Not the Grayscale palette**, which has no hue to order by. It decodes fine as frames.
 
 Stems — the drop lines from each knot to the base plane — are structure for the eye. They are
 drawn in a hue range past the end of the payload ramp so they cannot pollute the hue bins, but

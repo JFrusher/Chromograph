@@ -225,15 +225,16 @@ export default function Decoder({ getCurrentImage }: Props) {
                   v={
                     result.source === "frame-index"
                       ? "frame header"
-                      : result.source === "stem-geometry"
-                        ? "stem count"
                       : result.source === "calibration-bar"
                         ? "calibration bar"
                         : "curve fit"
                   }
                 />
                 <Row k="Characters" v={String(result.knotCount)} />
-                <Row k={result.mode === "iso" ? "Stem pixels" : "Curve pixels"} v={result.maskedPixels.toLocaleString()} />
+                <Row
+                  k={result.mode === "frames" ? "Frames read" : "Curve pixels"}
+                  v={result.maskedPixels.toLocaleString()}
+                />
               </tbody>
             </table>
 
@@ -296,17 +297,6 @@ function drawOverlay(ctx: CanvasRenderingContext2D, W: number, H: number, out: D
     }
   }
   ctx.stroke();
-
-  if (out.stems.length > 0) {
-    ctx.strokeStyle = "#ffffff";
-    ctx.lineWidth = Math.max(1, s);
-    ctx.beginPath();
-    for (const stem of out.stems) {
-      ctx.moveTo(stem.top.x, stem.top.y);
-      ctx.lineTo(stem.foot.x, stem.foot.y);
-    }
-    ctx.stroke();
-  }
 
   if (out.trace.length > 1) {
     ctx.strokeStyle = "#ffffff";

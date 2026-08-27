@@ -110,7 +110,12 @@ export default function Sidebar(p: Props) {
             </button>
           ))}
         </div>
-        {!p.preset.decodable && <Notice>No hue: exports of this palette cannot be decoded.</Notice>}
+        {!p.preset.hueOrdered && (
+          <Notice>
+            No hue, so a still image of this cannot be decoded. GIF, sheet and WebM still can:
+            their order comes from each frame&apos;s header, not from colour.
+          </Notice>
+        )}
       </Group>
 
       <Group label="Geometry">
