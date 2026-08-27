@@ -23,6 +23,21 @@ export const ZH = 0.9;
 
 export type P3 = { x: number; y: number; z: number };
 
+/**
+ * Yaw is a rotation about the vertical axis, applied before the projection.
+ *
+ * The projected bounds do not depend on it: the base square's rotated extent
+ * along both projection axes is the same at every angle, so `isoRect` stays a
+ * pure function of the canvas size and the decoder needs no extra information
+ * to place the scene. z still only affects screen y at any yaw, so stems stay
+ * vertical however far the scene is turned.
+ */
+function rotate(x: number, y: number, yaw: number) {
+  const c = Math.cos(yaw);
+  const s = Math.sin(yaw);
+  return { x: x * c - y * s, y: x * s + y * c };
+}
+
 /** Screen-space bounds of the whole scene, before it is fitted to a canvas. */
 export const ISO_BOX = { x0: -KX, x1: KX, y0: -KY - ZH, y1: KY };
 
@@ -34,17 +49,17 @@ export const ISO_BOX = { x0: -KX, x1: KX, y0: -KY - ZH, y1: KY };
  */
 export const zOf = (k: number, n: number) => (n < 1 ? 0 : (k + 1) / n);
 
-export function project(p: P3): Point {
-  const X = p.x - 0.5;
-  const Y = p.y - 0.5;
-  return { x: (X - Y) * KX, y: (X + Y) * KY - p.z * ZH };
+export function project(p: P3, yaw = 0): Point {
+  const r = rotate(p.x - 0.5, p.y - 0.5, yaw);
+  return { x: (r.x - r.y) * KX, y: (r.x + r.y) * KY - p.z * ZH };
 }
 
-/** Screen point + known height -> grid coordinates. Exact inverse of `project`. */
-export function unproject(sx: number, sy: number, z: number): Point {
-  const u = sx / KX; // X - Y
-  const v = (sy + z * ZH) / KY; // X + Y
-  return { x: (u + v) / 2 + 0.5, y: (v - u) / 2 + 0.5 };
+/** Screen point + known height and yaw -> grid coordinates. Exact inverse of `project`. */
+export function unproject(sx: number, sy: number, z: number, yaw = 0): Point {
+  const u = sx / KX; // Xr - Yr
+  const v = (sy + z * ZH) / KY; // Xr + Yr
+  const back = rotate((u + v) / 2, (v - u) / 2, -yaw);
+  return { x: back.x + 0.5, y: back.y + 0.5 };
 }
 
 export type IsoRect = {
@@ -82,12 +97,15 @@ export function isoRect(W: number, H: number): IsoRect {
 }
 
 /** 3D grid point -> canvas pixels. */
-export function toPx(p: P3, r: IsoRect): Point {
-  const sp = project(p);
+export function toPx(p: P3, r: IsoRect, yaw = 0): Point {
+  const sp = project(p, yaw);
   return { x: r.x + (sp.x - ISO_BOX.x0) * r.s, y: r.y + (sp.y - ISO_BOX.y0) * r.s };
 }
 
-/** Canvas pixels + known height -> grid coordinates. */
-export function fromPx(px: number, py: number, z: number, r: IsoRect): Point {
-  return unproject((px - r.x) / r.s + ISO_BOX.x0, (py - r.y) / r.s + ISO_BOX.y0, z);
+/** Canvas pixels + known height and yaw -> grid coordinates. */
+export function fromPx(px: number, py: number, z: number, r: IsoRect, yaw = 0): Point {
+  return unproject((px - r.x) / r.s + ISO_BOX.x0, (py - r.y) / r.s + ISO_BOX.y0, z, yaw);
 }
+
+/** Yaw for frame k of a full turn across n frames. */
+export const yawOf = (k: number, n: number) => (n < 1 ? 0 : (2 * Math.PI * k) / n);

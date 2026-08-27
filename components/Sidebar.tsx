@@ -1,6 +1,6 @@
 "use client";
 
-import { MAX_CHARS, type Sanitised } from "@/lib/grid";
+import { MAX_CHARS, STILL_RELIABLE_CHARS, type Sanitised } from "@/lib/grid";
 import { PRESETS, type Preset } from "@/lib/palette";
 import type { RenderParams, ViewMode } from "@/lib/render";
 
@@ -14,6 +14,10 @@ type Props = {
   setPresetId: (id: string) => void;
   onExportPNG: () => void;
   onExportSVG: () => void;
+  onExportAnimation: () => void;
+  onExportSheet: () => void;
+  onExportGif: () => void;
+  recording: boolean;
   onExportFourier: () => void;
   onCopyDesmos: () => void;
   equationNote: string | null;
@@ -41,10 +45,16 @@ export default function Sidebar(p: Props) {
             {p.clean.text.length} / {MAX_CHARS}
           </span>
         </div>
+        {p.clean.text.length > STILL_RELIABLE_CHARS && (
+          <Notice>
+            Past {STILL_RELIABLE_CHARS} characters a single still image is no longer dependable:
+            hue alone has to carry the order. Save a sheet or WebM, which decode exactly.
+          </Notice>
+        )}
         {(p.clean.dropped > 0 || p.clean.truncated) && (
           <Notice>
             {p.clean.dropped > 0 && `${p.clean.dropped} unsupported character(s) removed. `}
-            {p.clean.truncated && `Trimmed to ${MAX_CHARS}: past that the hue steps get too small to decode.`}
+            {p.clean.truncated && `Trimmed to ${MAX_CHARS}, the point where a sprite sheet stops being practical to decode.`}
           </Notice>
         )}
       </Group>
@@ -73,8 +83,8 @@ export default function Sidebar(p: Props) {
             <span>
               Stems
               <span className="block text-[var(--shadow)]">
-                Drop lines to the base plane. These carry the character order as geometry, which
-                survives what colour does not. Without them the image decodes by hue alone.
+                Drop lines from each knot to the base plane. Structure for the eye; the decode
+                does not depend on them.
               </span>
             </span>
           </label>
@@ -137,8 +147,22 @@ export default function Sidebar(p: Props) {
             Save SVG
           </button>
         </div>
+        <div className="flex gap-[3px]">
+          <button onClick={p.onExportSheet} className="w-out w-btn flex-1 min-w-0">
+            Sheet PNG
+          </button>
+          <button onClick={p.onExportGif} disabled={p.recording} className="w-out w-btn flex-1 min-w-0">
+            {p.recording ? "Working..." : "GIF"}
+          </button>
+          <button onClick={p.onExportAnimation} disabled={p.recording} className="w-out w-btn flex-1 min-w-0">
+            WebM
+          </button>
+        </div>
         <p className="text-[var(--shadow)]">
-          PNG is 2048 px on the short edge. Decode from PNG only: JPEG damages hue first.
+          Save PNG decodes by hue and is best effort. Sheet, GIF and WebM each carry one frame
+          per character stamped with its own index, and decode exactly. The GIF is the rotating
+          one and needs nothing from the browser; WebM needs a video encoder, which not every
+          browser has.
         </p>
       </Group>
 

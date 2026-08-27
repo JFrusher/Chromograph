@@ -4,14 +4,21 @@ import { useCallback, useMemo, useState } from "react";
 import CanvasView from "@/components/CanvasView";
 import Decoder from "@/components/Decoder";
 import Sidebar from "@/components/Sidebar";
-import { sanitize } from "@/lib/grid";
-import { presetById } from "@/lib/palette";
-import { DEFAULT_PARAMS, drawChromograph, type RenderParams } from "@/lib/render";
+import { sanitize, STILL_RELIABLE_CHARS } from "@/lib/grid";
+import { hexToRgb, presetById } from "@/lib/palette";
+import { DEFAULT_PARAMS, drawChromograph, MARKER_RGB, type RenderParams } from "@/lib/render";
 import { toSVG } from "@/lib/svg";
 import { desmosText, fitFourier, fourierText } from "@/lib/equation";
+import { ANIM_FPS, animationSupported, recordAnimation } from "@/lib/anim";
+import { sheetCols, sheetRows } from "@/lib/frame";
+import { buildLookup, buildPalette, encodeGif } from "@/lib/gif";
 
 /** Short edge of a PNG export, in pixels. */
 const EXPORT_SHORT_EDGE = 2048;
+/** GIF frames are small on purpose: one file holds every character. */
+const GIF_EDGE = 480;
+/** Frame delay in hundredths of a second. */
+const GIF_DELAY_CS = 10;
 
 export default function Page() {
   const [text, setText] = useState("HELLO WORLD");
@@ -20,6 +27,7 @@ export default function Page() {
   const [tab, setTab] = useState<"encode" | "decode">("encode");
   const [viewport, setViewport] = useState({ w: 1200, h: 900 });
   const [equationNote, setEquationNote] = useState<string | null>(null);
+  const [recording, setRecording] = useState(false);
 
   const preset = presetById(presetId);
   const clean = useMemo(() => sanitize(text), [text]);
@@ -86,10 +94,152 @@ export default function Page() {
     }
   };
 
+  /**
+   * One frame per character: the frame index IS the character index, so the
+   * animation is the encoding rather than a decoration of it.
+   */
+  const exportAnimation = async () => {
+    if (!animationSupported()) {
+      setEquationNote("This browser cannot record WebM.");
+      return;
+    }
+    const n = clean.text.length;
+    if (n < 2) {
+      setEquationNote("Need at least two characters to animate.");
+      return;
+    }
+    setRecording(true);
+    try {
+      const { width, height } = exportSize();
+      const blob = await recordAnimation({
+        width,
+        height,
+        frames: n,
+        draw: (ctx, k) =>
+          drawChromograph(ctx, {
+            text: clean.text,
+            params: { ...params, mode: "iso" },
+            preset,
+            width,
+            height,
+            frame: { k, n },
+          }),
+      });
+      download(`${slug(clean.text)}.webm`, blob);
+      setEquationNote(`${n} frames at ${ANIM_FPS} fps. This decodes exactly.`);
+    } catch (err) {
+      setEquationNote(err instanceof Error ? err.message : "Recording failed.");
+    } finally {
+      setRecording(false);
+    }
+  };
+
+  /** Renders one animation frame offscreen and hands back its pixels. */
+  const renderFrame = (k: number, n: number, width: number, height: number) => {
+    const canvas = document.createElement("canvas");
+    canvas.width = width;
+    canvas.height = height;
+    const ctx = canvas.getContext("2d", { willReadFrequently: true });
+    if (!ctx) return null;
+    drawChromograph(ctx, {
+      text: clean.text,
+      params: { ...params, mode: "iso" },
+      preset,
+      width,
+      height,
+      frame: { k, n },
+    });
+    return ctx.getImageData(0, 0, width, height);
+  };
+
+  /**
+   * The rotating animation as a GIF, encoded here rather than by the browser.
+   * Unlike WebM it needs nothing from the environment, so it works everywhere and
+   * embeds anywhere.
+   */
+  const exportGif = () => {
+    const n = clean.text.length;
+    if (n < 2) {
+      setEquationNote("Need at least two characters to animate.");
+      return;
+    }
+    setRecording(true);
+    try {
+      const aspect = viewport.w / Math.max(1, viewport.h);
+      const width = Math.round(aspect >= 1 ? GIF_EDGE * aspect : GIF_EDGE);
+      const height = Math.round(aspect >= 1 ? GIF_EDGE : GIF_EDGE / aspect);
+
+      const frames = [];
+      for (let k = 0; k < n; k++) {
+        const frame = renderFrame(k, n, width, height);
+        if (frame) frames.push(frame);
+      }
+      const palette = buildPalette(hexToRgb(preset.bg), MARKER_RGB);
+      const bytes = encodeGif({ frames, palette, lut: buildLookup(palette), delay: GIF_DELAY_CS });
+      download(`${slug(clean.text)}.gif`, new Blob([bytes], { type: "image/gif" }));
+      setEquationNote(`${n} frames, ${(bytes.length / 1e6).toFixed(1)} MB. This decodes exactly.`);
+    } catch (err) {
+      setEquationNote(err instanceof Error ? err.message : "GIF export failed.");
+    } finally {
+      setRecording(false);
+    }
+  };
+
+  /** Short edge of one tile. Smaller for long messages, to keep the sheet decodable. */
+  const tileEdge = (n: number) => (n <= 60 ? 640 : 512);
+
+  /**
+   * The same frames as the WebM, tiled into one lossless PNG. No encoder and no
+   * video playback needed to read it back, which makes it the dependable form.
+   */
+  const exportSheet = () => {
+    const n = clean.text.length;
+    if (n < 2) {
+      setEquationNote("Need at least two characters to make a sheet.");
+      return;
+    }
+    const aspect = viewport.w / Math.max(1, viewport.h);
+    const edge = tileEdge(n);
+    const tw = Math.round(aspect >= 1 ? edge * aspect : edge);
+    const th = Math.round(aspect >= 1 ? edge : edge / aspect);
+    const cols = sheetCols(n);
+    const rows = sheetRows(n);
+
+    const canvas = document.createElement("canvas");
+    canvas.width = cols * tw;
+    canvas.height = rows * th;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
+    ctx.fillStyle = preset.bg;
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+    for (let k = 0; k < n; k++) {
+      ctx.save();
+      ctx.translate((k % cols) * tw, Math.floor(k / cols) * th);
+      ctx.beginPath();
+      ctx.rect(0, 0, tw, th);
+      ctx.clip();
+      drawChromograph(ctx, {
+        text: clean.text,
+        params: { ...params, mode: "iso" },
+        preset,
+        width: tw,
+        height: th,
+        frame: { k, n },
+      });
+      ctx.restore();
+    }
+    canvas.toBlob((blob) => blob && download(`${slug(clean.text)}-sheet.png`, blob), "image/png");
+    setEquationNote(`${n} frames as ${cols} x ${rows} tiles. This decodes exactly.`);
+  };
+
+  // Renders at export resolution, so what this decodes is what a saved PNG would.
   const getCurrentImage = useCallback(() => {
-    const rendered = renderOffscreen(1600, 1200);
-    return rendered ? rendered.ctx.getImageData(0, 0, 1600, 1200) : null;
-  }, [renderOffscreen]);
+    const { width, height } = exportSize();
+    const rendered = renderOffscreen(width, height);
+    return rendered ? rendered.ctx.getImageData(0, 0, width, height) : null;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [renderOffscreen, viewport.w, viewport.h]);
 
   return (
     <div className="h-full p-1">
@@ -116,6 +266,10 @@ export default function Page() {
             setPresetId={setPresetId}
             onExportPNG={exportPNG}
             onExportSVG={exportSVG}
+            onExportAnimation={exportAnimation}
+            onExportSheet={exportSheet}
+            onExportGif={exportGif}
+            recording={recording}
             onExportFourier={exportFourier}
             onCopyDesmos={copyDesmos}
             equationNote={equationNote}
@@ -163,9 +317,9 @@ export default function Page() {
           <StatusCell>
             {!preset.decodable
               ? "Art only"
-              : params.mode === "iso" && params.stems
-                ? "Geometric + colour"
-                : "Colour only"}
+              : clean.text.length > STILL_RELIABLE_CHARS
+                ? "Sheet or WebM only"
+                : "Still: colour"}
           </StatusCell>
         </div>
       </div>

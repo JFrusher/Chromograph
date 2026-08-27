@@ -59,26 +59,41 @@ export function colorFor(seg: number, knotCount: number, preset: Preset): string
 }
 
 /**
- * Stems are drawn at this lightness, the curve at the preset's own (>= 42).
+ * Stems live in a hue range the payload never uses: 305..355, just past the
+ * ramp's magenta end.
  *
- * The gap is deliberate and load-bearing. hsl(h, 100%, 35%) has HSV value 0.70,
- * while every curve colour lands at 0.84 or above, so the decoder can mask
- * stems and curve into two sets that cannot overlap -- while both keep the exact
- * same hue, which is what lets colour still cross-check the geometry.
+ * Brightness cannot separate them from the curve, which is the trap. An
+ * antialiased curve edge fading into the background is that colour multiplied
+ * by coverage, and multiplying RGB by a scalar leaves hue and saturation alone
+ * while sweeping value continuously from 1 to 0 -- straight through any band
+ * you might reserve. Hue is the one channel antialiasing against a neutral
+ * background does not move.
+ *
+ * The range still varies with k, so two stems that overlap on screen usually
+ * differ enough in hue for the decoder to cut them apart.
  */
-export const STEM_LIGHT = 35;
+export const STEM_HUE_START = 305;
+export const STEM_HUE_SPAN = 50;
 
-/** Colour of the stem dropped from knot k. Same hue as the curve, darker. */
+export const stemHue = (k: number, knotCount: number) =>
+  knotCount < 2 ? STEM_HUE_START : STEM_HUE_START + (k / (knotCount - 1)) * STEM_HUE_SPAN;
+
+/** Colour of the stem dropped from knot k. */
 export function stemColorFor(k: number, knotCount: number, preset: Preset): string {
-  if (!preset.decodable) return `hsl(0, 0%, ${STEM_LIGHT}%)`;
-  return `hsl(${hueAt(k, knotCount).toFixed(2)}, ${preset.sat}%, ${STEM_LIGHT}%)`;
+  if (!preset.decodable) return "hsl(0, 0%, 45%)";
+  return `hsl(${stemHue(k, knotCount).toFixed(2)}, 100%, 50%)`;
+}
+
+export function hexToRgb(hex: string): [number, number, number] {
+  const h = hex.replace("#", "");
+  const n = parseInt(h.length === 3 ? h.replace(/./g, "$&$&") : h, 16);
+  return [(n >> 16) & 255, (n >> 8) & 255, n & 255];
 }
 
 /** Ink colour that reads against a preset's background. */
 export function contrastInk(bg: string): { r: number; g: number; b: number } {
-  const hex = bg.replace("#", "");
-  const n = parseInt(hex.length === 3 ? hex.replace(/./g, "$&$&") : hex, 16);
-  const luma = (((n >> 16) & 255) * 0.299 + ((n >> 8) & 255) * 0.587 + (n & 255) * 0.114) / 255;
+  const [r, g, b] = hexToRgb(bg);
+  const luma = (r * 0.299 + g * 0.587 + b * 0.114) / 255;
   return luma > 0.5 ? { r: 0, g: 0, b: 0 } : { r: 255, g: 255, b: 255 };
 }
 

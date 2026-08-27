@@ -7,8 +7,19 @@ export const COLS = 6;
 export const ROWS = 5;
 export const CELLS = COLS * ROWS; // 30
 
-/** Past this the hue step between characters drops below compression noise. */
-export const MAX_CHARS = 60;
+/**
+ * Ceiling for a message.
+ *
+ * Set by the sheet and animated formats, whose frame headers carry an index
+ * rather than measuring anything, and by how large a sprite sheet stays
+ * practical to decode in a browser. Still images are a different matter: hue has
+ * to carry the order there, and it stays reliable to about 60 characters --
+ * which the UI says rather than pretending otherwise.
+ */
+export const MAX_CHARS = 120;
+
+/** Beyond this, a single still image is no longer a dependable carrier. */
+export const STILL_RELIABLE_CHARS = 60;
 
 /** Smaller of the two cell pitches, in normalised units. */
 export const CELL_PITCH = Math.min(1 / COLS, 1 / ROWS);

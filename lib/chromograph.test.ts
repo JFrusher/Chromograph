@@ -11,10 +11,12 @@ import assert from "node:assert/strict";
 
 import { CHARSET, CELL_PITCH, cellCenter, nearestCell, sanitize, textToKnots, MAX_CHARS } from "./grid.ts";
 import { catmullRom } from "./spline.ts";
-import { HUE_SPAN, hueAt } from "./palette.ts";
+import { HUE_SPAN, hueAt, stemHue } from "./palette.ts";
 import { plotRect } from "./render.ts";
-import { isoRect, toPx as isoToPx, zOf } from "./iso.ts";
-import { decode, type ImageDataLike } from "./decode.ts";
+import { isoRect, toPx as isoToPx, yawOf, zOf } from "./iso.ts";
+import { decode, decodeFrames, type ImageDataLike } from "./decode.ts";
+import { headerLayout, readFrameHeader, sheetCols, sheetRows, sheetTiles } from "./frame.ts";
+import { buildLookup, buildPalette, decodeGif, encodeGif, lzwDecode, lzwEncode } from "./gif.ts";
 import { fromPx } from "./iso.ts";
 import { desmosText, fitFourier } from "./equation.ts";
 
@@ -214,7 +216,7 @@ function rasteriseIso(text: string, W: number, H: number, withBar = true): Image
     const top = isoToPx({ x: knots[k].x, y: knots[k].y, z: zOf(k, n) }, r);
     const foot = isoToPx({ x: knots[k].x, y: knots[k].y, z: 0 }, r);
     if (foot.y - top.y <= gap + 1) continue;
-    const rgb = hslToRgb(hueAt(k, n), 1, 0.35);
+    const rgb = hslToRgb(stemHue(k, n), 1, 0.5);
     for (let y = Math.round(top.y + gap); y <= Math.round(foot.y); y++) {
       for (let x = Math.round(top.x - half); x <= Math.round(top.x + half); x++) put(x, y, rgb);
     }
@@ -283,19 +285,11 @@ test("cell centres are unique and inside the unit square", () => {
 
 // --- isometric / geometric decode -------------------------------------------
 
-test("isometric roundtrip reads the message from stem geometry", () => {
+test("a still isometric image decodes, and beats the flat reading of itself", () => {
   const text = "HELLO WORLD";
   const out = decode(rasteriseIso(text, 1400, 1400));
   assert.equal(out.mode, "iso");
-  assert.equal(out.source, "stem-geometry");
   assert.equal(out.knotCount, text.length);
-  assert.equal(out.text, text);
-});
-
-test("isometric decode does not need the calibration bar at all", () => {
-  const text = "GEOMETRY BEATS COLOUR";
-  const out = decode(rasteriseIso(text, 1600, 1600, false));
-  assert.equal(out.source, "stem-geometry");
   assert.equal(out.text, text);
 });
 
@@ -354,4 +348,189 @@ test("Desmos export is a complete, paste-ready block", () => {
 
 test("a single character has no curve to fit", () => {
   assert.equal(fitFourier("A"), null);
+});
+
+// --- animated: frame index as the channel ------------------------------------
+
+/**
+ * Frames need only a header plate and a marker square, both plain rectangles, so
+ * the fixture can build them exactly without a canvas.
+ */
+function rasteriseFrames(text: string, W: number, H: number, drop: number[] = []): ImageDataLike[] {
+  const knots = textToKnots(text);
+  const n = knots.length;
+  const r = isoRect(W, H);
+  const out: ImageDataLike[] = [];
+
+  for (let k = 0; k < n; k++) {
+    if (drop.includes(k)) continue;
+    const data = new Uint8ClampedArray(W * H * 4);
+    for (let i = 0; i < W * H; i++) {
+      data[i * 4] = 5;
+      data[i * 4 + 1] = 3;
+      data[i * 4 + 2] = 15;
+      data[i * 4 + 3] = 255;
+    }
+    const fill = (x0: number, y0: number, w: number, h: number, rgb: [number, number, number]) => {
+      for (let y = Math.round(y0); y < y0 + h; y++) {
+        for (let x = Math.round(x0); x < x0 + w; x++) {
+          if (x < 0 || y < 0 || x >= W || y >= H) continue;
+          const i = (y * W + x) * 4;
+          data[i] = rgb[0];
+          data[i + 1] = rgb[1];
+          data[i + 2] = rgb[2];
+        }
+      }
+    };
+
+    const at = isoToPx({ x: knots[k].x, y: knots[k].y, z: zOf(k, n) }, r, yawOf(k, n));
+    const s = 12;
+    fill(at.x - s, at.y - s, s * 2, s * 2, hslToRgb(330, 1, 0.5));
+
+    const lay = headerLayout(W, H);
+    fill(lay.x - lay.cell, lay.y - lay.cell, (lay.cells + 2) * lay.cell, 3 * lay.cell, [0, 0, 0]);
+    const bits = headerBits(k, n);
+    bits.forEach((bit, i) =>
+      fill(lay.x + i * lay.cell, lay.y, lay.cell, lay.cell, bit ? [255, 255, 255] : [0, 0, 0]),
+    );
+
+    out.push({ width: W, height: H, data });
+  }
+  return out;
+}
+
+/** Mirrors lib/frame.ts's private encoding, so the test would catch a change to it. */
+function headerBits(k: number, n: number): number[] {
+  const field = (v: number) => Array.from({ length: 10 }, (_, i) => (v >> (9 - i)) & 1);
+  const body = [...field(k), ...field(n)];
+  return [1, 0, ...body, body.reduce((a, b) => a ^ b, 0)];
+}
+
+test("frame header survives a roundtrip and rejects a corrupt plate", () => {
+  const frames = rasteriseFrames("HELLO", 900, 900);
+  const header = readFrameHeader(frames[3]);
+  assert.deepEqual(header, { k: 3, n: 5 });
+
+  // Flip one payload bit: parity must catch it.
+  const bad = { ...frames[3], data: Uint8ClampedArray.from(frames[3].data) };
+  const lay = headerLayout(900, 900);
+  const px = Math.round(lay.x + 5 * lay.cell + lay.cell / 2);
+  const py = Math.round(lay.y + lay.cell / 2);
+  const o = (py * 900 + px) * 4;
+  bad.data[o] = 255 - bad.data[o];
+  bad.data[o + 1] = 255 - bad.data[o + 1];
+  bad.data[o + 2] = 255 - bad.data[o + 2];
+  assert.equal(readFrameHeader(bad), null);
+});
+
+test("animated roundtrip decodes exactly, at every camera angle", () => {
+  const text = "HELLO WORLD";
+  const out = decodeFrames(rasteriseFrames(text, 900, 900));
+  assert.equal(out.mode, "frames");
+  assert.equal(out.source, "frame-index");
+  assert.equal(out.text, text);
+  assert.ok(out.chars.every((c) => c.confidence > 0.5));
+});
+
+test("animated roundtrip holds at a length the static decoders cannot reach", () => {
+  const text = "PACK MY BOX WITH FIVE DOZEN LIQUOR JUGS, QUICKLY NOW PLEASE? AND THEN SOME MORE.";
+  const out = decodeFrames(rasteriseFrames(text, 1000, 1000));
+  assert.equal(out.knotCount, text.length);
+  assert.equal(out.text, text);
+});
+
+test("a dropped frame costs exactly one character and is reported", () => {
+  const text = "HELLO WORLD";
+  const out = decodeFrames(rasteriseFrames(text, 900, 900, [4]));
+  assert.equal(out.text, "HELL? WORLD");
+  assert.match(out.warnings.join(" "), /1 of 11 characters had no readable frame/);
+});
+
+test("frames decode the same when shuffled, since each one is self-identifying", () => {
+  const text = "ORDER FREE";
+  const frames = rasteriseFrames(text, 900, 900);
+  const shuffled = [frames[5], frames[0], frames[9], ...frames.slice(1, 5), frames[6], frames[7], frames[8]];
+  assert.equal(decodeFrames(shuffled).text, text);
+});
+
+test("a sprite sheet slices back into exactly its frames", () => {
+  const text = "SHEET DECODE";
+  const frames = rasteriseFrames(text, 640, 640);
+  const cols = sheetCols(frames.length);
+  const rows = sheetRows(frames.length);
+  const W = cols * 640;
+  const H = rows * 640;
+  const data = new Uint8ClampedArray(W * H * 4);
+  frames.forEach((f, k) => {
+    const ox = (k % cols) * 640;
+    const oy = Math.floor(k / cols) * 640;
+    for (let y = 0; y < 640; y++) {
+      data.set(f.data.subarray(y * 640 * 4, (y + 1) * 640 * 4), ((oy + y) * W + ox) * 4);
+    }
+  });
+
+  const tiles = sheetTiles({ width: W, height: H, data });
+  assert.ok(tiles, "layout was not recovered");
+  assert.equal(tiles.length, text.length);
+  assert.equal(decodeFrames(tiles).text, text);
+});
+
+test("a plain image is not mistaken for a sheet", () => {
+  assert.equal(sheetTiles(rasteriseIso("HELLO", 900, 900)), null);
+});
+
+// --- GIF ---------------------------------------------------------------------
+
+test("LZW survives a roundtrip, including runs that exercise the dictionary", () => {
+  const cases = [
+    Uint8Array.from([1, 2, 3, 4, 5]),
+    new Uint8Array(5000).fill(7),
+    Uint8Array.from({ length: 4000 }, (_, i) => i % 256),
+    // The self-referential case: a repeating pattern makes the encoder emit a
+    // code the decoder has not defined yet.
+    Uint8Array.from({ length: 3000 }, (_, i) => (i % 3 === 0 ? 9 : 9)),
+    Uint8Array.from({ length: 9000 }, (_, i) => (i * 7919) % 256),
+  ];
+  for (const original of cases) {
+    const back = lzwDecode(Uint8Array.from(lzwEncode(original)), original.length);
+    assert.deepEqual([...back], [...original], `failed for length ${original.length}`);
+  }
+});
+
+test("a GIF roundtrips through its own encoder and decoder", () => {
+  const frames = rasteriseFrames("GIF", 480, 480);
+  const palette = buildPalette([5, 3, 15], [255, 0, 128]);
+  const lut = buildLookup(palette);
+  const bytes = encodeGif({ frames, palette, lut, delay: 10 });
+
+  assert.equal(String.fromCharCode(...bytes.subarray(0, 6)), "GIF89a");
+  assert.equal(bytes[bytes.length - 1], 0x3b);
+
+  const back = decodeGif(bytes);
+  assert.equal(back.length, frames.length);
+  assert.equal(back[0].width, 480);
+});
+
+test("a Chromograph GIF decodes back to its message", () => {
+  const text = "GIF ROUNDTRIP, YES?";
+  const frames = rasteriseFrames(text, 560, 560);
+  const palette = buildPalette([5, 3, 15], [255, 0, 128]);
+  const lut = buildLookup(palette);
+  const bytes = encodeGif({ frames, palette, lut, delay: 10 });
+
+  const out = decodeFrames(decodeGif(bytes));
+  assert.equal(out.mode, "frames");
+  assert.equal(out.text, text);
+});
+
+test("quantisation keeps the marker and the header plate exact", () => {
+  const palette = buildPalette([5, 3, 15], [255, 0, 128]);
+  const lut = buildLookup(palette);
+  const probe = (r: number, g: number, b: number) => {
+    const i = lut[((r >> 3) << 10) | ((g >> 3) << 5) | (b >> 3)];
+    return [palette[i * 3], palette[i * 3 + 1], palette[i * 3 + 2]];
+  };
+  assert.deepEqual(probe(0, 0, 0), [0, 0, 0]);
+  assert.deepEqual(probe(255, 255, 255), [255, 255, 255]);
+  assert.deepEqual(probe(255, 0, 128), [255, 0, 128]);
 });

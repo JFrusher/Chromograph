@@ -3,10 +3,25 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { CELLS, COLS, ROWS, cellCenter } from "@/lib/grid";
 import { isoRect, toPx as isoToPx } from "@/lib/iso";
-import { decode, gridToImage, type DecodeResult } from "@/lib/decode";
+import { decode, decodeFrames, gridToImage, type DecodeResult } from "@/lib/decode";
+import { framesFromVideo } from "@/lib/anim";
+import { sheetTiles } from "@/lib/frame";
+import { decodeGif } from "@/lib/gif";
 
-/** Bounds the decode passes and the debug canvas on huge uploads. */
+/** Bounds the decode passes and the debug canvas on huge still uploads. */
 const MAX_EDGE = 2048;
+/** Sheets are read at full size, so this is the real ceiling. */
+const MAX_PIXELS = 60_000_000;
+
+function toImageData(bitmap: ImageBitmap, w: number, h: number): ImageData {
+  const canvas = document.createElement("canvas");
+  canvas.width = w;
+  canvas.height = h;
+  const ctx = canvas.getContext("2d", { willReadFrequently: true });
+  if (!ctx) throw new Error("no 2d context");
+  ctx.drawImage(bitmap, 0, 0, w, h);
+  return ctx.getImageData(0, 0, w, h);
+}
 
 type Props = {
   /** Renders the current studio artwork offscreen, so it can be decoded without a file. */
@@ -19,34 +34,81 @@ export default function Decoder({ getCurrentImage }: Props) {
   const [note, setNote] = useState<string | null>(null);
   const [dragging, setDragging] = useState(false);
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const fromVideo = useRef(false);
 
   const load = useCallback(async (file: File) => {
     setNote(null);
+    if (/video|\.webm$/i.test(file.type || file.name)) {
+      try {
+        setNote("Reading frames. This plays the animation through, so it takes about as long as the clip.");
+        const frames = await framesFromVideo(file, (n) => setNote(`Read ${n} frames...`));
+        if (frames.length === 0) throw new Error("No frames were readable.");
+        fromVideo.current = true;
+        setImage(frames[0]);
+        setResult(decodeFrames(frames));
+        setNote(null);
+      } catch (err) {
+        setNote(err instanceof Error ? err.message : "Could not read that video.");
+      }
+      return;
+    }
+    if (/gif/i.test(file.type || file.name)) {
+      try {
+        setNote("Decoding GIF frames...");
+        const frames = decodeGif(new Uint8Array(await file.arrayBuffer()));
+        if (frames.length === 0) throw new Error("That GIF has no frames.");
+        fromVideo.current = true;
+        setImage(new ImageData(new Uint8ClampedArray(frames[0].data), frames[0].width, frames[0].height));
+        setResult(decodeFrames(frames));
+        setNote(null);
+      } catch (err) {
+        setNote(err instanceof Error ? err.message : "Could not read that GIF.");
+      }
+      return;
+    }
+
     try {
       const bitmap = await createImageBitmap(file);
+      if (bitmap.width * bitmap.height > MAX_PIXELS) {
+        bitmap.close();
+        throw new Error("That image is too large to decode.");
+      }
+
+      // Sheets must be examined at full resolution: downscaling makes the tile
+      // grid non-integer and the layout unrecoverable.
+      const full = toImageData(bitmap, bitmap.width, bitmap.height);
+      const tiles = sheetTiles(full);
+      if (tiles) {
+        fromVideo.current = true;
+        setImage(new ImageData(new Uint8ClampedArray(tiles[0].data), tiles[0].width, tiles[0].height));
+        setResult(decodeFrames(tiles));
+        bitmap.close();
+        return;
+      }
+
       const scale = Math.min(1, MAX_EDGE / Math.max(bitmap.width, bitmap.height));
-      const w = Math.round(bitmap.width * scale);
-      const h = Math.round(bitmap.height * scale);
-      const canvas = document.createElement("canvas");
-      canvas.width = w;
-      canvas.height = h;
-      const ctx = canvas.getContext("2d", { willReadFrequently: true });
-      if (!ctx) throw new Error("no 2d context");
-      ctx.drawImage(bitmap, 0, 0, w, h);
+      setImage(toImageData(bitmap, Math.round(bitmap.width * scale), Math.round(bitmap.height * scale)));
       bitmap.close();
-      setImage(ctx.getImageData(0, 0, w, h));
       if (/jpe?g/i.test(file.type)) {
         setNote("JPEG detected. Chroma subsampling smears hue, which is the only thing carrying the message. Expect errors.");
       }
-    } catch {
-      setNote("Could not read that file. PNG, WebP or JPEG only.");
+    } catch (err) {
+      setNote(err instanceof Error ? err.message : "Could not read that file. PNG, WebP, JPEG or WebM only.");
       setImage(null);
       setResult(null);
     }
   }, []);
 
+  // Stills decode from the image itself; an animation has already produced its
+  // result by the time the first frame lands here, so it must not be re-decoded.
   useEffect(() => {
-    setResult(image ? decode(image) : null);
+    if (!image || fromVideo.current) {
+      fromVideo.current = false;
+      return;
+    }
+    // A sprite sheet is still a PNG, so it arrives here; frames win when present.
+    const tiles = sheetTiles(image);
+    setResult(tiles ? decodeFrames(tiles) : decode(image));
   }, [image]);
 
   // Separate pass: the debug canvas is only mounted once there is a result, so
@@ -79,16 +141,17 @@ export default function Decoder({ getCurrentImage }: Props) {
           dragging ? "outline-2 outline-dotted outline-[var(--dark)] -outline-offset-4" : ""
         }`}
       >
-        <p className="font-bold">Drop a Chromograph PNG here</p>
+        <p className="font-bold">Drop a Chromograph PNG, sheet, GIF or WebM here</p>
         <p className="max-w-[440px] text-[var(--shadow)]">
-          The grid position is derived from the image dimensions, so the export must be uncropped.
-          Exports with the calibration bar decode most reliably.
+          A sheet, GIF or WebM decodes exactly: every frame states which character it is, so
+          order, dropped frames and compression all stop mattering. A still image is best effort.
+          Either way the scene is placed from the file's dimensions, so it must be uncropped.
         </p>
         <div className="flex gap-[3px]">
           <label className="w-out w-btn">
             <input
               type="file"
-              accept="image/png,image/webp,image/jpeg"
+              accept="image/png,image/webp,image/jpeg,image/gif,video/webm"
               className="hidden"
               onChange={(e) => {
                 const file = e.target.files?.[0];
@@ -113,8 +176,16 @@ export default function Decoder({ getCurrentImage }: Props) {
 
       {result && (
         <div className="grid gap-2 lg:grid-cols-[minmax(0,1fr)_300px]">
-          <div className="w-in p-1">
-            <canvas ref={canvasRef} className="block h-auto w-full" />
+          <div className="flex flex-col gap-1">
+            <div className="w-in p-1">
+              <canvas ref={canvasRef} className="block h-auto w-full" />
+            </div>
+            {result.mode === "frames" && (
+              <p className="text-[var(--shadow)]">
+                Showing frame 1 of {result.knotCount}. Each of the others was read at its own
+                camera angle.
+              </p>
+            )}
           </div>
 
           <div className="flex flex-col gap-2">
@@ -145,12 +216,17 @@ export default function Decoder({ getCurrentImage }: Props) {
 
             <table className="w-full">
               <tbody>
-                <Row k="Read from" v={result.mode === "iso" ? "stem geometry" : "hue"} />
+                <Row
+                  k="Read from"
+                  v={result.mode === "frames" ? "frame index" : result.mode === "iso" ? "stem geometry" : "hue"}
+                />
                 <Row
                   k="Length source"
                   v={
-                    result.source === "stem-geometry"
-                      ? "stem count"
+                    result.source === "frame-index"
+                      ? "frame header"
+                      : result.source === "stem-geometry"
+                        ? "stem count"
                       : result.source === "calibration-bar"
                         ? "calibration bar"
                         : "curve fit"
@@ -198,7 +274,7 @@ function drawOverlay(ctx: CanvasRenderingContext2D, W: number, H: number, out: D
   ctx.strokeStyle = "rgba(255,255,255,0.3)";
   ctx.lineWidth = Math.max(1, s);
   ctx.beginPath();
-  if (out.mode === "iso") {
+  if (out.mode === "iso" || out.mode === "frames") {
     // The base plane the stem feet were measured against.
     const r = isoRect(W, H);
     for (let i = 0; i <= COLS; i++) {
@@ -245,7 +321,10 @@ function drawOverlay(ctx: CanvasRenderingContext2D, W: number, H: number, out: D
   ctx.textAlign = "center";
   ctx.textBaseline = "middle";
   ctx.lineWidth = Math.max(1, s);
-  out.chars.forEach((c, i) => {
+  // In a multi-frame decode every marker was found on its own frame, at its own
+  // camera angle. Only the frame actually on screen may be drawn over it.
+  const shown = out.mode === "frames" ? out.chars.slice(0, 1) : out.chars;
+  shown.forEach((c, i) => {
     if (!c.at) return;
     ctx.fillStyle = c.confidence > 0.6 ? "#00ff00" : c.confidence > 0.35 ? "#ffff00" : "#ff0000";
     ctx.fillRect(c.at.x - box, c.at.y - box, box * 2, box * 2);

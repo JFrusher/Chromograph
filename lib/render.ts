@@ -3,7 +3,8 @@
 import { CELLS, COLS, ROWS, cellCenter, textToKnots, type Point } from "./grid.ts";
 import { catmullRom } from "./spline.ts";
 import { colorFor, contrastInk, hueAt, stemColorFor, type Preset } from "./palette.ts";
-import { isoRect, toPx as isoPx, zOf, type IsoRect } from "./iso.ts";
+import { isoRect, toPx as isoPx, yawOf, zOf, type IsoRect } from "./iso.ts";
+import { drawFrameHeader, type FrameHeader } from "./frame.ts";
 
 export type ViewMode = "flat" | "iso";
 
@@ -70,6 +71,12 @@ export type DrawOptions = {
   preset: Preset;
   width: number;
   height: number;
+  /**
+   * One frame of the animated format. The frame index IS the character index,
+   * which is what makes the animated decode exact: nothing analog is measured,
+   * the marked knot's height and the camera angle both follow from k.
+   */
+  frame?: FrameHeader;
 };
 
 export function drawChromograph(ctx: CanvasRenderingContext2D, o: DrawOptions): void {
@@ -130,15 +137,19 @@ function drawFlatGrid(ctx: CanvasRenderingContext2D, r: PlotRect, opacity: numbe
 // --- isometric -------------------------------------------------------------
 
 function drawIso(ctx: CanvasRenderingContext2D, o: DrawOptions) {
-  const { width: W, height: H, preset, params } = o;
+  const { width: W, height: H, preset, params, frame } = o;
   const r = isoRect(W, H);
   const scale = Math.min(W, H) / 1000;
   const knots = textToKnots(o.text);
   const n = knots.length;
+  const yaw = frame ? yawOf(frame.k, frame.n) : 0;
 
-  drawBasePlane(ctx, r, params.gridOpacity, scale, preset);
+  drawBasePlane(ctx, r, params.gridOpacity, scale, preset, yaw);
 
-  if (n === 0) return;
+  if (n === 0) {
+    if (frame) drawFrameHeader(ctx, W, H, frame);
+    return;
+  }
 
   const curve = n >= 2 ? catmullRom(knots, params.tension, samplesPerSegment(n)) : { pts: knots, seg: [0] };
 
@@ -150,7 +161,7 @@ function drawIso(ctx: CanvasRenderingContext2D, o: DrawOptions) {
     ctx.lineWidth = Math.max(1, scale);
     ctx.beginPath();
     curve.pts.forEach((p, i) => {
-      const q = isoPx({ x: p.x, y: p.y, z: 0 }, r);
+      const q = isoPx({ x: p.x, y: p.y, z: 0 }, r, yaw);
       if (i === 0) ctx.moveTo(q.x, q.y);
       else ctx.lineTo(q.x, q.y);
     });
@@ -158,13 +169,21 @@ function drawIso(ctx: CanvasRenderingContext2D, o: DrawOptions) {
   }
 
   if (n >= 2) {
-    const px = curve.pts.map((p, i) => isoPx({ x: p.x, y: p.y, z: zOf(curve.seg[i], n) }, r));
+    const px = curve.pts.map((p, i) => isoPx({ x: p.x, y: p.y, z: zOf(curve.seg[i], n) }, r, yaw));
     strokeRibbon(ctx, px, curve.seg, n, preset, Math.max(1, params.thickness * scale));
   } else {
-    const p = isoPx({ x: knots[0].x, y: knots[0].y, z: zOf(0, 1) }, r);
+    const p = isoPx({ x: knots[0].x, y: knots[0].y, z: zOf(0, 1) }, r, yaw);
     const s = params.thickness * scale;
     ctx.fillStyle = colorFor(0, 1, preset);
     ctx.fillRect(p.x - s, p.y - s, s * 2, s * 2);
+  }
+
+  if (frame) {
+    // Animated frames carry no stems: the marker owns the reserved hue range,
+    // and the frame header already states which character this is.
+    drawMarker(ctx, knots, frame, r, scale, params.thickness, yaw);
+    drawFrameHeader(ctx, W, H, frame);
+    return;
   }
 
   // Stems go on last, after the curve. Drawn first, every place the curve crossed
@@ -175,22 +194,73 @@ function drawIso(ctx: CanvasRenderingContext2D, o: DrawOptions) {
   if (params.showBar && preset.decodable) drawCalibrationBar(ctx, r.bar, n, scale);
 }
 
+/**
+ * Colour reserved for the frame marker: hsl(330, 100%, 50%), clear of the
+ * payload ramp (0..300). Held as RGB so the GIF palette can hold it exactly.
+ */
+export const MARKER_RGB: [number, number, number] = [255, 0, 128];
+const MARKER_CSS = `rgb(${MARKER_RGB.join(",")})`;
+
+/**
+ * Highlights the one knot this frame is about, with a drop line to the base so
+ * the eye can place it. Position plus the frame's own k is everything the
+ * decoder needs: k gives the knot's height and the camera angle, and those make
+ * the projection invertible.
+ */
+function drawMarker(
+  ctx: CanvasRenderingContext2D,
+  knots: Point[],
+  frame: FrameHeader,
+  r: IsoRect,
+  scale: number,
+  thickness: number,
+  yaw: number,
+) {
+  const knot = knots[Math.min(frame.k, knots.length - 1)];
+  const z = zOf(frame.k, knots.length);
+  const at = isoPx({ x: knot.x, y: knot.y, z }, r, yaw);
+  const foot = isoPx({ x: knot.x, y: knot.y, z: 0 }, r, yaw);
+
+  // Desaturated: the decoder takes the median of fully saturated marker pixels,
+  // and a long drop line at full chroma would drag that median down towards the
+  // base plane instead of leaving it on the square.
+  ctx.strokeStyle = "hsl(330, 40%, 45%)";
+  ctx.lineWidth = Math.max(1, thickness * scale * 0.35);
+  ctx.beginPath();
+  ctx.moveTo(at.x, at.y);
+  ctx.lineTo(foot.x, foot.y);
+  ctx.stroke();
+
+  // Floor of 6px: GIF frames are small, and the decoder needs enough marker
+  // pixels left after quantisation to take a stable median.
+  const s = Math.max(6, thickness * scale * 1.6);
+  ctx.fillStyle = MARKER_CSS;
+  ctx.fillRect(at.x - s, at.y - s, s * 2, s * 2);
+}
+
 /** Wireframe 6x5 grid lying at z = 0. Projection is affine, so cell edges stay straight. */
-function drawBasePlane(ctx: CanvasRenderingContext2D, r: IsoRect, opacity: number, scale: number, preset: Preset) {
+function drawBasePlane(
+  ctx: CanvasRenderingContext2D,
+  r: IsoRect,
+  opacity: number,
+  scale: number,
+  preset: Preset,
+  yaw = 0,
+) {
   if (opacity <= 0) return;
   const ink = contrastInk(preset.bg);
   ctx.strokeStyle = `rgba(${ink.r},${ink.g},${ink.b},${(opacity * 0.5).toFixed(3)})`;
   ctx.lineWidth = Math.max(1, scale);
   ctx.beginPath();
   for (let i = 0; i <= COLS; i++) {
-    const a = isoPx({ x: i / COLS, y: 0, z: 0 }, r);
-    const b = isoPx({ x: i / COLS, y: 1, z: 0 }, r);
+    const a = isoPx({ x: i / COLS, y: 0, z: 0 }, r, yaw);
+    const b = isoPx({ x: i / COLS, y: 1, z: 0 }, r, yaw);
     ctx.moveTo(a.x, a.y);
     ctx.lineTo(b.x, b.y);
   }
   for (let j = 0; j <= ROWS; j++) {
-    const a = isoPx({ x: 0, y: j / ROWS, z: 0 }, r);
-    const b = isoPx({ x: 1, y: j / ROWS, z: 0 }, r);
+    const a = isoPx({ x: 0, y: j / ROWS, z: 0 }, r, yaw);
+    const b = isoPx({ x: 1, y: j / ROWS, z: 0 }, r, yaw);
     ctx.moveTo(a.x, a.y);
     ctx.lineTo(b.x, b.y);
   }
