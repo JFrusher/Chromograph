@@ -74,6 +74,16 @@ export type DrawOptions = {
    * the marked knot's height and the camera angle both follow from k.
    */
   frame?: FrameHeader;
+  /**
+   * Draw the frame's header plate. On by default, because every file format
+   * needs it to be decodable at all.
+   *
+   * The live display turns it off: it reads its index from its own surround
+   * instead, at a scale a lens can actually resolve, and the plate is a
+   * hundred-and-tenth of the frame sampled at a single pixel -- unreadable from
+   * a camera, and so only a mark on the artwork.
+   */
+  plate?: boolean;
 };
 
 export function drawChromograph(ctx: CanvasRenderingContext2D, o: DrawOptions): void {
@@ -144,7 +154,7 @@ function drawIso(ctx: CanvasRenderingContext2D, o: DrawOptions) {
   drawBasePlane(ctx, r, params.gridOpacity, scale, preset, yaw);
 
   if (n === 0) {
-    if (frame) drawFrameHeader(ctx, W, H, frame);
+    if (frame && o.plate !== false) drawFrameHeader(ctx, W, H, frame);
     return;
   }
 
@@ -179,7 +189,7 @@ function drawIso(ctx: CanvasRenderingContext2D, o: DrawOptions) {
     // Animated frames carry no stems: the marker owns the reserved hue range,
     // and the frame header already states which character this is.
     drawMarker(ctx, knots, frame, r, scale, params.thickness, yaw, preset);
-    drawFrameHeader(ctx, W, H, frame);
+    if (o.plate !== false) drawFrameHeader(ctx, W, H, frame);
     return;
   }
 

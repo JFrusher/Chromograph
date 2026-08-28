@@ -1,10 +1,23 @@
 /**
  * The frame the laptop displays for a phone camera to read.
  *
- * The artwork itself is unchanged -- `drawChromograph` renders into the middle of
- * this frame exactly as it renders into an export. What is added around it is
- * registration furniture, carrying no payload: four corner fiducials that pin the
- * projective transform, and a header band stating which character this frame is.
+ * A white disc holding the artwork, ringed by a black band whose outer edge is
+ * scalloped into bumps and indents. The band carries no payload of its own: four
+ * holes punched through it at the diagonals pin the projective transform, and the
+ * scalloping states which character this frame is.
+ *
+ * The shape does structural work as well as visual:
+ *
+ *  - The white disc *circumscribes* the artwork square, so the rectified
+ *    buffer's four corners land inside it and read as ground. That is exactly
+ *    where `markerAt` samples the background from, so nothing downstream of the
+ *    rectification has to know the composition changed.
+ *  - The anchors are holes rather than bumps because a band is a single
+ *    connected blob -- anything attached to it has no centroid of its own. A
+ *    hole is an isolated bright region, while an indent stays connected to the
+ *    page outside and is discarded along with it. So the only bright blobs in
+ *    the frame are the four anchors, and there is nothing for them to compete
+ *    with.
  *
  * The layout is a frozen constant rather than a function of the canvas size, and
  * that is the one real departure from `isoRect`/`plotRect`. Those derive their
@@ -13,125 +26,174 @@
  * is 1920 wide or 3840. So both sides hardcode this composition, and the display
  * scales it to fit with a single transform.
  *
- * Coordinates put the artwork's top-left at the origin, so negative values are
- * the furniture above and to the left of it.
+ * Coordinates put the artwork's top-left at the origin, so the band runs negative
+ * above and to the left of it.
  */
 
 import { MAX_CHARS } from "./grid.ts";
-import { contrastInk, type Preset } from "./palette.ts";
+import { type Preset } from "./palette.ts";
 import { drawChromograph, type RenderParams } from "./render.ts";
 
-const INNER_W = 1200;
-const INNER_H = 900;
-/** Clear background between artwork and band, so neither bleeds into the other. */
-const GAP = 18;
-/** Thickness of the band annulus, and the side of a fiducial square. */
-const BAND = 48;
-/** Background beyond the annulus. Gives the blob finder an edge to work against. */
-const QUIET = 48;
+/**
+ * The artwork region, shaped to the scene rather than to the disc.
+ *
+ * ISO_BOX is 1.73 wide by 1.9 tall, and `isoRect` reserves a further 12% of the
+ * smaller side to padding plus 8% of the height to the calibration bar's slot,
+ * so the scene that actually gets drawn is markedly taller than it is wide. A
+ * square region inscribed in the disc therefore wastes most of its width.
+ *
+ * These proportions are the ones that maximise the drawn scene for a given disc:
+ * balancing isoRect's two limits puts the height at about 1.18 times the width,
+ * which fits roughly a tenth more curve inside the same circle than a square
+ * does. The disc, not the region, is what the eye reads as the shape.
+ */
+const INNER_W = 1108;
+const INNER_H = 1307;
 
-/** Cells per band edge: see `bandBits`. */
-const CELLS = 30;
+/** Half-diagonal of the artwork region: the smallest disc that can contain it. */
+const INNER_HALF_DIAG = Math.hypot(INNER_W, INNER_H) / 2;
 
-const B0 = -(GAP + BAND); // outer edge of the top/left annulus
-const B1 = -GAP; //          inner edge of the top/left annulus
+/** The white disc the artwork sits on, and the band's inner edge. */
+const DISC_R = 862;
 
 /**
- * Where a band's cells run: the span *between* the fiducials, which occupy the
- * annulus corners. Nothing else lives in the annulus, so a cell and a fiducial
- * can never be mistaken for one another by position.
+ * Nominal outer edge of the band, and the radius the data is read at.
+ *
+ * A set cell bulges the edge out past this, a clear one scallops it in, so a
+ * sample taken exactly here is inside the band for a 1 and outside it for a 0.
  */
-const RUN_X = { from: B1, to: INNER_W - B1 }; // top and bottom bands
-const RUN_Y = { from: B1, to: INNER_H - B1 }; // left and right bands
+const BAND_R = 990;
+/** How far a bump reaches out, and an indent cuts in. */
+const BUMP = 30;
+
+/** Anchor holes: centred in the band, in the flat gaps between the data arcs. */
+const ANCHOR_R = 926;
+const ANCHOR_D = 80;
+
+/** Degrees of arc each of the four data runs occupies, out of the 90 available. */
+const ARC_SPAN = 78;
+/** Cells per arc: see `bandBits`. */
+const CELLS = 30;
+
+/** Ground beyond the band. Keeps blobs off the image edge. */
+const QUIET = 50;
+
+/** Centre of the composition, in artwork coordinates. */
+const CX = INNER_W / 2;
+const CY = INNER_H / 2;
+const DEG = Math.PI / 180;
+
+/** The axis each data arc is centred on: top, bottom, left, right. */
+const ARC_CENTRE_DEG = [270, 90, 180, 0];
+/** Angular width of one cell. */
+const CELL_DEG = ARC_SPAN / CELLS;
 
 /** Top, bottom, left, right. */
 export type Edge = 0 | 1 | 2 | 3;
 
+const norm360 = (d: number) => ((d % 360) + 360) % 360;
+
+const onCircle = (deg: number, r: number) => ({
+  x: CX + r * Math.cos(deg * DEG),
+  y: CY + r * Math.sin(deg * DEG),
+});
+
+/** How far the composition reaches from its centre. */
+const EXTENT = BAND_R + BUMP;
+
 export const SHOW = {
   inner: { x: 0, y: 0, w: INNER_W, h: INNER_H },
-  band: BAND,
-  gap: GAP,
   cells: CELLS,
-  /** Side of a fiducial square. */
-  fidSize: BAND,
+  /** The white disc the artwork sits on. */
+  disc: { x: CX, y: CY, r: DISC_R },
+  bandRadius: BAND_R,
+  bump: BUMP,
+  fidSize: ANCHOR_D,
 
   /** The whole composition, quiet zone included. */
   total: {
-    x: B0 - QUIET,
-    y: B0 - QUIET,
-    w: INNER_W - 2 * B0 + 2 * QUIET,
-    h: INNER_H - 2 * B0 + 2 * QUIET,
+    x: CX - EXTENT - QUIET,
+    y: CY - EXTENT - QUIET,
+    w: 2 * (EXTENT + QUIET),
+    h: 2 * (EXTENT + QUIET),
   },
 
   /**
-   * Fiducial centres, in the order the detector reports them: top-left,
-   * top-right, bottom-right, bottom-left. These four points are the entire
-   * correspondence the homography is fitted through.
+   * Anchor centres, in the order the detector reports them: top-left, top-right,
+   * bottom-right, bottom-left. These four points are the entire correspondence
+   * the homography is fitted through, which is why there are four and not three
+   * -- three points fix only an affine transform, and a phone held at an angle
+   * produces real perspective.
    *
-   * The rectangle they form is deliberately not square. A wrong 90 degree
-   * orientation hypothesis then produces a quad of visibly wrong aspect, which
-   * is a free pre-filter before anything is spent on reading cells.
+   * On the diagonals, not on the axes. `cornerQuad` selects by the extremes of
+   * x+y and x-y, and four points at top/right/bottom/left tie on both, so the
+   * selection would be degenerate. The diagonals are also where the data arcs
+   * leave a flat gap in the band, which is the room these need.
    */
   fid: [
-    { x: B0 + BAND / 2, y: B0 + BAND / 2 },
-    { x: INNER_W - B0 - BAND / 2, y: B0 + BAND / 2 },
-    { x: INNER_W - B0 - BAND / 2, y: INNER_H - B0 - BAND / 2 },
-    { x: B0 + BAND / 2, y: INNER_H - B0 - BAND / 2 },
+    onCircle(225, ANCHOR_R),
+    onCircle(315, ANCHOR_R),
+    onCircle(45, ANCHOR_R),
+    onCircle(135, ANCHOR_R),
   ] as const,
 
-  /** Width and height of one band cell on a given edge. */
-  cellSize(edge: Edge): { w: number; h: number } {
-    const along = edge < 2 ? (RUN_X.to - RUN_X.from) / CELLS : (RUN_Y.to - RUN_Y.from) / CELLS;
-    return edge < 2 ? { w: along, h: BAND } : { w: BAND, h: along };
-  },
-
-  /** Centre of cell `i` on a given edge, in show coordinates. */
+  /**
+   * Where cell `i` of an arc is read, on the nominal band edge.
+   *
+   * Every arc runs clockwise and names itself in its word. A rotated hypothesis
+   * therefore samples a real arc and gets an undamaged reading whose arc id is
+   * wrong, which is rejected outright rather than by a bet on how far
+   * perspective can skew an aspect ratio.
+   */
   cellCentre(edge: Edge, i: number): { x: number; y: number } {
-    const t = i + 0.5;
-    const alongX = RUN_X.from + (t * (RUN_X.to - RUN_X.from)) / CELLS;
-    const alongY = RUN_Y.from + (t * (RUN_Y.to - RUN_Y.from)) / CELLS;
-    switch (edge) {
-      case 0:
-        return { x: alongX, y: B0 + BAND / 2 };
-      case 1:
-        return { x: alongX, y: INNER_H - B0 - BAND / 2 };
-      case 2:
-        return { x: B0 + BAND / 2, y: alongY };
-      default:
-        return { x: INNER_W - B0 - BAND / 2, y: alongY };
-    }
+    return onCircle(ARC_CENTRE_DEG[edge] - ARC_SPAN / 2 + (i + 0.5) * CELL_DEG, BAND_R);
   },
 } as const;
+
+// The disc has to contain the artwork square, or the rectified buffer's corners
+// fall outside it, markerAt reads the background from the band instead, and the
+// marker's polarity comes out backwards. Cheap to assert, and it fires at import
+// rather than in the field.
+if (DISC_R <= INNER_HALF_DIAG) {
+  throw new Error(`DISC_R ${DISC_R} does not contain the artwork region (needs > ${INNER_HALF_DIAG})`);
+}
+// An anchor hole must sit clear of both edges of the band, including where an
+// indent cuts the outer edge inwards.
+if (ANCHOR_R - ANCHOR_D / 2 <= DISC_R || ANCHOR_R + ANCHOR_D / 2 >= BAND_R) {
+  throw new Error("anchor holes do not fit inside the band");
+}
 
 /**
  * Stroke width used on the display, overriding whatever the studio slider says.
  *
  * The marker is a square of half-side `max(6, thickness * min(W,H)/1000 * 1.6)`.
- * At the inner size that scale is 0.9, so thickness 6 gives a 17px marker, which
- * shrinks to about 9px once rectified into the decode buffer -- around 85 pixels,
- * barely over `MIN_MARKER_PIXELS` before lens blur erodes the core. Thickness 10
- * gives roughly 237 pixels instead, and a fatter stroke reads better through a
- * lens anyway.
+ * What matters is how many of its pixels survive to `markerAt`, which needs
+ * `MIN_MARKER_PIXELS` of them.
  *
- * A knob, not a constant: raise it if characters go missing, lower it if the
- * curve looks too heavy.
+ * A round composition costs marker pixels, and this is where that is paid back:
+ * a square pattern is height-limited in a 16:9 camera frame, so it fills less of
+ * that frame than a landscape rectangle would. Measured against a lens blur,
+ * this leaves roughly five times the floor -- the margin that survives a focus
+ * hunt or a glare pass.
+ *
+ * A knob, not a constant: lower it if the curve looks too heavy.
  */
-export const SHOW_THICKNESS = 10;
+export const SHOW_THICKNESS = 22;
 
 // --- band codec --------------------------------------------------------------
 
 const SYNC = [1, 0, 1, 1] as const;
 /** MAX_CHARS is 120, so seven bits covers the whole range of both fields. */
 const FIELD_BITS = 7;
-/** Which of the four edges this band is. See `bandBits`. */
+/** Which of the four arcs this word belongs to. See `bandBits`. */
 const EDGE_BITS = 2;
 
 /**
- * CRC-8/ATM over the two payload bytes. Bitwise, no table -- it runs sixteen
- * times per band, not per pixel.
+ * CRC-8/ATM over the payload bytes. Bitwise, no table -- it runs sixteen times
+ * per arc, not per pixel.
  *
  * The file format's single parity bit is far too weak here. A camera makes
- * correlated errors, and a misread band that still parses becomes a wrong
+ * correlated errors, and a misread word that still parses becomes a wrong
  * character committed silently, with nothing downstream to catch it. This has
  * Hamming distance 4 at this length, so every one, two and three bit error is
  * rejected.
@@ -149,21 +211,19 @@ const bitsOf = (v: number, n: number) => Array.from({ length: n }, (_, i) => (v 
 const numOf = (bits: number[]) => bits.reduce((a, b) => (a << 1) | b, 0);
 
 /**
- * The 30-bit word a band carries: guard, sync, edge id, k, n, CRC, guard.
+ * The 30-bit word an arc carries: guard, sync, arc id, k, n, CRC, guard.
  *
- * The guards at both ends are always clear, so a set cell can never be
- * four-connected to a fiducial and merge with it into a single blob. Two cells of
- * budget is a cheaper fix than a pixel gap that would have to be tuned.
+ * The guards at both ends are always clear, so the cells nearest an anchor are
+ * always indents -- the band keeps its full thickness where the holes are.
  *
- * The edge id is what actually rejects a rotated reading, and it is not
- * redundant with the sync word. Every edge runs in its own canonical direction,
- * so under a 90 degree wrong hypothesis the reader traverses a *different*
- * physical edge along that edge's own forward direction and receives an
- * undamaged word: sync intact, CRC intact, k and n correct, and a marker read
- * out of a rotated warp that decodes to the wrong character with nothing left to
- * catch it. Naming the edge inside the CRC turns that into a deterministic
- * mismatch instead of a bet on how far perspective can skew an aspect ratio.
- * A 180 degree hypothesis reverses the word and dies on sync as expected.
+ * The arc id is what actually rejects a rotated reading, and it is not redundant
+ * with the sync word. Every arc runs in the same direction, so under a 90 degree
+ * wrong hypothesis the reader traverses a *different* arc along that arc's own
+ * forward direction and receives an undamaged word: sync intact, CRC intact, k
+ * and n correct, and a marker read out of a rotated rectification that decodes
+ * to the wrong character with nothing left to catch it. Naming the arc inside
+ * the CRC turns that into a deterministic mismatch. A 180 degree hypothesis
+ * lands on a different arc too, and is rejected the same way.
  */
 export function bandBits(k: number, n: number, edge: Edge): number[] {
   const body = [...bitsOf(edge, EDGE_BITS), ...bitsOf(k, FIELD_BITS), ...bitsOf(n, FIELD_BITS)];
@@ -171,12 +231,12 @@ export function bandBits(k: number, n: number, edge: Edge): number[] {
 }
 
 /**
- * Read a band word back, or null if it is not the word this edge should carry.
+ * Read an arc's word back, or null if it is not the word this arc should carry.
  *
  * The sync word earns its four cells three times over. It rejects a reversed
  * reading, it confirms polarity so an inverted image is thrown out rather than
- * quietly misread, and it guarantees the band holds both a set and a clear cell
- * -- which is what lets the reader threshold against that band's own extremes
+ * quietly misread, and it guarantees the arc holds both a set and a clear cell
+ * -- which is what lets the reader threshold against that arc's own extremes
  * instead of a global one.
  */
 export function parseBand(bits: number[], expectEdge: Edge): { k: number; n: number } | null {
@@ -199,53 +259,146 @@ export function parseBand(bits: number[], expectEdge: Edge): { k: number; n: num
   return { k, n };
 }
 
+// --- band profile ------------------------------------------------------------
+
+/**
+ * Angular resolution the edge is precomputed at. A tenth of a degree is under
+ * two units of arc at the band's radius, so the curve reads as continuous, and
+ * one table serves both the renderer and the reader without recomputing an
+ * interpolation per pixel.
+ */
+const PROFILE_STEPS = 3600;
+
+/** Where a control point sits: the cell centres, plus the flat gaps between arcs. */
+function bandControls(k: number, n: number): { deg: number; r: number }[] {
+  const out: { deg: number; r: number }[] = [];
+  for (let e = 0; e < 4; e++) {
+    const word = bandBits(k, n, e as Edge);
+    for (let i = 0; i < CELLS; i++) {
+      out.push({
+        deg: norm360(ARC_CENTRE_DEG[e] - ARC_SPAN / 2 + (i + 0.5) * CELL_DEG),
+        r: BAND_R + (word[i] ? BUMP : -BUMP),
+      });
+    }
+  }
+  // The diagonals stay at the nominal radius, which is the room the anchors need.
+  for (let g = 0; g < 4; g++) out.push({ deg: norm360(45 + 90 * g), r: BAND_R });
+  return out.sort((a, b) => a.deg - b.deg);
+}
+
+/**
+ * The band's outer edge for one frame, sampled around the whole circle.
+ *
+ * The bit is the value *at* a cell centre, and the edge eases between one centre
+ * and the next rather than returning to nominal at every boundary. Two set cells
+ * in a row therefore merge into a single broad lobe instead of two separate
+ * teeth, which is what makes the edge read as a flowing wave rather than a saw.
+ *
+ * It also reads better. Returning to nominal between cells puts the edge at half
+ * amplitude a quarter of a cell either side of centre; easing between centres
+ * holds it at seven tenths there, and at full amplitude whenever the neighbouring
+ * bit agrees. The sampler is most decisive exactly where the decision is made.
+ */
+export function bandProfile(k: number, n: number): Float64Array {
+  const ctrl = bandControls(k, n);
+  const out = new Float64Array(PROFILE_STEPS);
+
+  for (let s = 0; s < PROFILE_STEPS; s++) {
+    const deg = (s * 360) / PROFILE_STEPS;
+    let i = ctrl.length - 1;
+    for (let c = 0; c < ctrl.length; c++) if (ctrl[c].deg <= deg) i = c;
+    const a = ctrl[i];
+    const b = ctrl[(i + 1) % ctrl.length];
+    let span = b.deg - a.deg;
+    if (span <= 0) span += 360;
+    let into = deg - a.deg;
+    if (into < 0) into += 360;
+    const u = span === 0 ? 0 : into / span;
+    out[s] = a.r + ((b.r - a.r) * (1 - Math.cos(Math.PI * u))) / 2;
+  }
+  return out;
+}
+
+/** The band's outer radius at an angle, from a precomputed profile. */
+export const radiusAt = (profile: Float64Array, deg: number) =>
+  profile[Math.floor((norm360(deg) / 360) * PROFILE_STEPS) % PROFILE_STEPS];
+
 // --- drawing -----------------------------------------------------------------
+
+/** The page, and the disc the artwork sits on. */
+export const SHOW_GROUND = "#ffffff";
+/** The band. */
+export const SHOW_INK = "#000000";
+
+/**
+ * The artwork's palette, fixed rather than chosen.
+ *
+ * Its background is the white disc, so the marker is black. That is the harder
+ * polarity for `markerAt`, whose achromatic test is a saturation ratio and so
+ * degenerates towards black -- which is exactly what `normalise` corrects for
+ * before the marker is looked for.
+ *
+ * `hueOrdered` is false, and has to be: a monochromatic curve has no hue left to
+ * carry the character order. That costs nothing here, because the order comes
+ * from the band instead.
+ */
+export const SHOW_PRESET: Preset = {
+  id: "show",
+  name: "Display",
+  bg: SHOW_GROUND,
+  sat: 100,
+  light: 45,
+  hueOrdered: false,
+  hue: 214,
+};
 
 export type ShowOptions = {
   text: string;
   params: RenderParams;
-  preset: Preset;
   frame: { k: number; n: number };
 };
+
+/** Angular step the band's outer edge is drawn at. Fine enough to read as a curve. */
+const EDGE_STEP_DEG = 0.4;
 
 /**
  * Draw one display frame, in show coordinates. The caller places and scales it.
  *
  * The artwork goes down through the untouched `drawChromograph`, translated into
- * the inner rect -- the same translate-and-draw the sprite sheet export already
- * uses. Its own small header plate comes along with it, which costs nothing and
- * means a screenshot cropped to the artwork still opens in the existing decoder.
- * The camera never reads that plate: its cells are a hundred-and-tenth of the
- * frame sampled at a single pixel, which is exactly the scale a lens destroys.
+ * the inner square -- the same translate-and-draw the sprite sheet export already
+ * uses. It fills that square with its own background, which is invisible here
+ * because the square is inscribed in a disc of the same colour.
  */
 export function drawShowFrame(ctx: CanvasRenderingContext2D, o: ShowOptions): void {
-  const { total } = SHOW;
-  const ink = contrastInk(o.preset.bg);
+  const { total, disc } = SHOW;
+  const profile = bandProfile(o.frame.k, o.frame.n);
 
   ctx.save();
-  ctx.fillStyle = o.preset.bg;
+  ctx.fillStyle = SHOW_GROUND;
   ctx.fillRect(total.x, total.y, total.w, total.h);
 
-  ctx.fillStyle = "rgb(" + ink.r + "," + ink.g + "," + ink.b + ")";
-  for (const f of SHOW.fid) ctx.fillRect(f.x - BAND / 2, f.y - BAND / 2, BAND, BAND);
+  // The band as a single path: the scalloped outer edge, then the disc as a hole
+  // wound the other way so the even-odd rule leaves an annulus.
+  ctx.fillStyle = SHOW_INK;
+  ctx.beginPath();
+  for (let deg = 0; deg < 360; deg += EDGE_STEP_DEG) {
+    const p = onCircle(deg, radiusAt(profile, deg));
+    if (deg === 0) ctx.moveTo(p.x, p.y);
+    else ctx.lineTo(p.x, p.y);
+  }
+  ctx.closePath();
+  ctx.moveTo(disc.x + disc.r, disc.y);
+  ctx.arc(disc.x, disc.y, disc.r, 0, 2 * Math.PI, true);
+  ctx.fill("evenodd");
 
-  // Each edge runs in its own canonical direction -- top and bottom left to
-  // right, left and right top to bottom -- and names itself, so a rotated
-  // reading lands the wrong edge id in the slot and is rejected outright.
-  //
-  // Four edges rather than one is also the tearing defence. A camera exposure
-  // straddling a display transition reads bands from both frames, so they
-  // disagree on k and the frame is thrown away. Requiring the same answer on two
-  // successive camera frames would not do it: a free-running camera holds phase
-  // against the display for hundreds of milliseconds, so a tear reproduces at
-  // the same scanline and the same wrong answer arrives twice.
-  for (const edge of [0, 1, 2, 3] as Edge[]) {
-    const { w, h } = SHOW.cellSize(edge);
-    bandBits(o.frame.k, o.frame.n, edge).forEach((bit, i) => {
-      if (!bit) return;
-      const c = SHOW.cellCentre(edge, i);
-      ctx.fillRect(c.x - w / 2, c.y - h / 2, w, h);
-    });
+  // Anchors are holes through the band. A hole is an isolated bright region,
+  // which is what gives it a centroid of its own -- a bump would just be more of
+  // the band, with no separate blob to find.
+  ctx.fillStyle = SHOW_GROUND;
+  for (const f of SHOW.fid) {
+    ctx.beginPath();
+    ctx.arc(f.x, f.y, ANCHOR_D / 2, 0, 2 * Math.PI);
+    ctx.fill();
   }
 
   ctx.save();
@@ -253,10 +406,13 @@ export function drawShowFrame(ctx: CanvasRenderingContext2D, o: ShowOptions): vo
   drawChromograph(ctx, {
     text: o.text,
     params: { ...o.params, mode: "iso", thickness: SHOW_THICKNESS },
-    preset: o.preset,
+    preset: SHOW_PRESET,
     width: SHOW.inner.w,
     height: SHOW.inner.h,
     frame: o.frame,
+    // The band already states the index, at a scale a camera can resolve. The
+    // plate would only be a mark on the artwork that nothing here ever reads.
+    plate: false,
   });
   ctx.restore();
   ctx.restore();

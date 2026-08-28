@@ -305,6 +305,18 @@ export default function Page() {
                   {label}
                 </button>
               ))}
+
+              {/* Hand the message off to the display page, which is what a phone
+                  camera reads. The URL carries everything, so this is a
+                  convenience rather than the only way in. */}
+              <a
+                className="w-out w-btn ml-auto self-end px-3 py-[3px] text-[var(--dark)] no-underline"
+                href={`/show?t=${encodeURIComponent(clean.text)}`}
+                target="_blank"
+                rel="noopener"
+              >
+                Send to phone
+              </a>
             </div>
 
             {/* Both panes stay mounted so switching tabs does not drop the

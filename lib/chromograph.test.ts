@@ -11,7 +11,7 @@ import assert from "node:assert/strict";
 
 import { CHARSET, CELL_PITCH, cellCenter, nearestCell, sanitize, textToKnots, MAX_CHARS } from "./grid.ts";
 import { catmullRom } from "./spline.ts";
-import { HUE_SPAN, hueAt, stemHue } from "./palette.ts";
+import { HUE_SPAN, colorFor, contrastInk, hueAt, markerInk, presetById, rgbToHsv, stemHue } from "./palette.ts";
 import { plotRect } from "./render.ts";
 import { isoRect, toPx as isoToPx, yawOf, zOf } from "./iso.ts";
 import { decode, decodeFrames, type ImageDataLike } from "./decode.ts";
@@ -20,7 +20,19 @@ import { buildLookup, buildPalette, decodeGif, encodeGif, lzwDecode, lzwEncode }
 import { fromPx } from "./iso.ts";
 import { desmosText, fitFourier } from "./equation.ts";
 import { applyH, solveHomography } from "./homography.ts";
-import { SHOW, bandBits, parseBand, type Edge } from "./showframe.ts";
+import {
+  SHOW,
+  SHOW_GROUND,
+  SHOW_INK,
+  SHOW_PRESET,
+  SHOW_THICKNESS,
+  bandBits,
+  bandProfile,
+  radiusAt,
+  parseBand,
+  type Edge,
+} from "./showframe.ts";
+import { normalise, scanFrame } from "./scan.ts";
 
 // --- grid -------------------------------------------------------------------
 
@@ -696,41 +708,469 @@ test("an out-of-range band is rejected even when its CRC agrees", () => {
   assert.deepEqual(parseBand(bandBits(0, 1, 0), 0), { k: 0, n: 1 });
 });
 
-test("the show frame furniture never overlaps the artwork", () => {
-  const { inner, total, fid, cells } = SHOW;
+test("the disc contains the artwork and the furniture stays outside it", () => {
+  const { inner, total, disc, fid, cells } = SHOW;
+  const centre = { x: inner.x + inner.w / 2, y: inner.y + inner.h / 2 };
+  const from = (p: { x: number; y: number }) => Math.hypot(p.x - centre.x, p.y - centre.y);
 
-  // The artwork sits strictly inside the composition.
-  assert.ok(total.x < inner.x && total.y < inner.y);
-  assert.ok(total.x + total.w > inner.x + inner.w);
-  assert.ok(total.y + total.h > inner.y + inner.h);
+  assert.equal(disc.x, centre.x);
+  assert.equal(disc.y, centre.y);
 
-  const overlapsInner = (x: number, y: number, w: number, h: number) =>
-    x < inner.x + inner.w && x + w > inner.x && y < inner.y + inner.h && y + h > inner.y;
-
-  for (const f of fid) {
-    const s = SHOW.fidSize;
-    assert.ok(!overlapsInner(f.x - s / 2, f.y - s / 2, s, s), "fiducial over artwork");
-    // And inside the quiet zone, so the blob finder sees background all round.
-    assert.ok(f.x - s / 2 > total.x && f.x + s / 2 < total.x + total.w);
-    assert.ok(f.y - s / 2 > total.y && f.y + s / 2 < total.y + total.h);
+  // Load-bearing, not cosmetic: the rectified buffer's corners are where
+  // markerAt samples the background, so every corner of the artwork square has
+  // to be inside the disc or the marker's polarity is read backwards.
+  for (const corner of [
+    { x: inner.x, y: inner.y },
+    { x: inner.x + inner.w, y: inner.y },
+    { x: inner.x + inner.w, y: inner.y + inner.h },
+    { x: inner.x, y: inner.y + inner.h },
+  ]) {
+    assert.ok(from(corner) < disc.r, "artwork corner at " + from(corner).toFixed(1) + " escapes the disc");
   }
 
+  const touchesArtwork = (p: { x: number; y: number }, pad: number) =>
+    p.x + pad > inner.x && p.x - pad < inner.x + inner.w && p.y + pad > inner.y && p.y - pad < inner.y + inner.h;
+  const insideTotal = (p: { x: number; y: number }, pad: number) =>
+    p.x - pad > total.x &&
+    p.x + pad < total.x + total.w &&
+    p.y - pad > total.y &&
+    p.y + pad < total.y + total.h;
+
+  // Nothing may sit over the artwork, and nothing may touch the image edge --
+  // findBlobs discards any blob whose bounding box reaches the border.
+  for (const f of fid) {
+    assert.ok(!touchesArtwork(f, SHOW.fidSize / 2), "an anchor overlaps the artwork");
+    assert.ok(insideTotal(f, SHOW.fidSize / 2), "an anchor reaches the image edge");
+    assert.ok(from(f) > disc.r, "an anchor sits on the disc");
+  }
+  // Every reading point sits on the band, clear of both the artwork and the edge.
   for (const edge of EDGES) {
-    const { w, h } = SHOW.cellSize(edge);
     for (let i = 0; i < cells; i++) {
       const c = SHOW.cellCentre(edge, i);
-      assert.ok(!overlapsInner(c.x - w / 2, c.y - h / 2, w, h), "band cell over artwork");
-      assert.ok(c.x > total.x && c.x < total.x + total.w, "band cell outside frame");
-      assert.ok(c.y > total.y && c.y < total.y + total.h, "band cell outside frame");
+      assert.ok(!touchesArtwork(c, 0), "a reading point overlaps the artwork");
+      assert.ok(insideTotal(c, SHOW.bump), "a reading point reaches the image edge");
+      assert.ok(from(c) > disc.r, "a reading point falls inside the disc");
     }
   }
 
-  // Fiducial centres form a rectangle, and a distinctly non-square one so a
-  // transposed orientation guess is visibly wrong before any cell is read.
-  assert.equal(fid[0].y, fid[1].y);
-  assert.equal(fid[2].y, fid[3].y);
-  assert.equal(fid[0].x, fid[3].x);
-  assert.equal(fid[1].x, fid[2].x);
-  const ratio = (fid[1].x - fid[0].x) / (fid[3].y - fid[0].y);
-  assert.ok(ratio > 1.2 && ratio < 1.5, "fiducial aspect " + ratio);
+  // Each anchor has to win its own corner outright. cornerQuad selects by the
+  // extremes of x+y and x-y, so anchors on the axes would tie on both and the
+  // selection would be degenerate -- which is why they sit on the diagonals.
+  //
+  // Nothing else competes: the anchors are the only bright blobs that survive
+  // the filters, since the page touches the image edge, the disc is far too
+  // large, and an indent stays connected to the page outside. The data is dark
+  // band material and is never a candidate at all.
+  const scores = [
+    (p: { x: number; y: number }) => p.x + p.y,
+    (p: { x: number; y: number }) => -(p.x - p.y),
+    (p: { x: number; y: number }) => -(p.x + p.y),
+    (p: { x: number; y: number }) => p.x - p.y,
+  ];
+  for (let corner = 0; corner < 4; corner++) {
+    const best = scores[corner](fid[corner]);
+    for (const other of fid) {
+      if (other !== fid[corner]) assert.ok(scores[corner](other) > best, "two anchors tie on a corner");
+    }
+  }
+});
+
+// --- camera scan -------------------------------------------------------------
+
+/**
+ * A show frame as pixels, without a canvas.
+ *
+ * Only the parts the scanner actually reads: background, fiducials, the four
+ * bands, the marker square and the header plate. The spline itself is left out
+ * for the same reason rasteriseFrames leaves it out -- it is saturated, and
+ * markerAt rejects anything saturated before it looks at luminance.
+ */
+/** Which data arc an angle falls in, or null for the flat gaps. */
+function arcAt(deg: number): number | null {
+  const a = ((deg % 360) + 360) % 360;
+  const centres = [270, 90, 180, 0];
+  for (let e = 0; e < 4; e++) {
+    const into = ((a - (centres[e] - 39)) % 360 + 360) % 360;
+    if (into < 78) return e;
+  }
+  return null;
+}
+
+function buildShowFrame(
+  text: string,
+  k: number,
+  n: number,
+  opts: { fiducials?: number; bandFrom?: number[] } = {},
+): ImageDataLike {
+  const { total, inner, disc } = SHOW;
+  const W = Math.round(total.w);
+  const H = Math.round(total.h);
+  const data = new Uint8ClampedArray(W * H * 4);
+
+  const INK: [number, number, number] = [0, 0, 0];
+  const GROUND: [number, number, number] = [255, 255, 255];
+  for (let i = 0; i < W * H; i++) {
+    data[i * 4] = GROUND[0];
+    data[i * 4 + 1] = GROUND[1];
+    data[i * 4 + 2] = GROUND[2];
+    data[i * 4 + 3] = 255;
+  }
+
+  // Show coordinates to pixels: the image is exactly the total rect.
+  const px = (x: number) => x - total.x;
+  const py = (y: number) => y - total.y;
+  const put = (x: number, y: number, rgb: [number, number, number]) => {
+    if (x < 0 || y < 0 || x >= W || y >= H) return;
+    const i = (y * W + x) * 4;
+    data[i] = rgb[0];
+    data[i + 1] = rgb[1];
+    data[i + 2] = rgb[2];
+  };
+  const fill = (x0: number, y0: number, w: number, h: number, rgb: [number, number, number]) => {
+    for (let y = Math.round(y0); y < Math.round(y0 + h); y++) {
+      for (let x = Math.round(x0); x < Math.round(x0 + w); x++) put(x, y, rgb);
+    }
+  };
+  const dot = (cx: number, cy: number, r: number, rgb: [number, number, number]) => {
+    for (let y = Math.floor(cy - r); y <= cy + r; y++) {
+      for (let x = Math.floor(cx - r); x <= cx + r; x++) {
+        if (Math.hypot(x - cx, y - cy) > r) continue;
+        put(x, y, rgb);
+      }
+    }
+  };
+
+  // The band, drawn by testing each pixel against the shared profile -- so the
+  // fixture and the renderer cannot drift apart on the shape of the edge.
+  const from = opts.bandFrom ?? [k, k, k, k];
+  const profile = bandProfile(from[0], n);
+  // A torn frame needs each arc built from its own index, which the shared
+  // profile cannot express -- so those are patched in per arc below.
+  const perArc = from.map((f) => bandProfile(f, n));
+  const cx = px(disc.x);
+  const cy = py(disc.y);
+  for (let y = 0; y < H; y++) {
+    for (let x = 0; x < W; x++) {
+      const dx = x - cx;
+      const dy = y - cy;
+      const r = Math.hypot(dx, dy);
+      if (r < disc.r) continue;
+      const deg = (Math.atan2(dy, dx) * 180) / Math.PI;
+      const arc = arcAt(deg);
+      if (r > radiusAt(arc === null ? profile : perArc[arc], deg)) continue;
+      put(x, y, INK);
+    }
+  }
+
+  // Anchor holes punched back out of the band.
+  SHOW.fid.slice(0, opts.fiducials ?? 4).forEach((f) => dot(px(f.x), py(f.y), SHOW.fidSize / 2, GROUND));
+
+  // The artwork's marker: black, because the disc it sits on is white.
+  const knots = textToKnots(text);
+  const rect = isoRect(inner.w, inner.h);
+  const at = isoToPx({ x: knots[k].x, y: knots[k].y, z: zOf(k, n) }, rect, yawOf(k, n));
+  const s = Math.max(6, ((SHOW_THICKNESS * Math.min(inner.w, inner.h)) / 1000) * 1.6);
+  fill(px(inner.x + at.x - s), py(inner.y + at.y - s), s * 2, s * 2, INK);
+
+  return { width: W, height: H, data };
+}
+
+type Quad = { x: number; y: number }[];
+
+/** Roughly filling the frame, square on. */
+const FRONTAL: Quad = [
+  { x: 110, y: 14 },
+  { x: 530, y: 14 },
+  { x: 530, y: 346 },
+  { x: 110, y: 346 },
+];
+/** Held at an angle, on both axes. */
+const TILTED: Quad = [
+  { x: 90, y: 40 },
+  { x: 505, y: 15 },
+  { x: 540, y: 330 },
+  { x: 120, y: 350 },
+];
+/** Phone turned on its side: the source top-left arrives at camera top-right. */
+const ROTATED: Quad = [
+  { x: 448, y: 18 },
+  { x: 448, y: 342 },
+  { x: 192, y: 342 },
+  { x: 192, y: 18 },
+];
+/** Further away and off to one side. */
+const OFFSET: Quad = [
+  { x: 230, y: 30 },
+  { x: 610, y: 30 },
+  { x: 610, y: 330 },
+  { x: 230, y: 330 },
+];
+
+/**
+ * What a phone does to a screen.
+ *
+ * Projects the source onto an arbitrary quad, then applies the degradations that
+ * actually break absolute thresholds: a lens blur, a white balance cast, reduced
+ * contrast with lifted blacks from auto exposure, and sensor noise.
+ */
+function fakeCamera(src: ImageDataLike, quad: Quad, W: number, H: number): ImageDataLike {
+  const nq = quad.map((p) => ({ x: p.x / (W / 2) - 1, y: p.y / (H / 2) - 1 }));
+  const ns = [
+    { x: -1, y: -1 },
+    { x: 1, y: -1 },
+    { x: 1, y: 1 },
+    { x: -1, y: 1 },
+  ];
+  const inv = solveHomography(nq, ns);
+  assert.ok(inv, "fixture quad is degenerate");
+
+  let buf = new Uint8ClampedArray(W * H * 4);
+  // A dim room, not black: the detector has to find the screen against something.
+  for (let i = 0; i < W * H; i++) {
+    buf[i * 4] = 34;
+    buf[i * 4 + 1] = 32;
+    buf[i * 4 + 2] = 30;
+    buf[i * 4 + 3] = 255;
+  }
+
+  for (let y = 0; y < H; y++) {
+    for (let x = 0; x < W; x++) {
+      const p = applyH(inv, { x: (x + 0.5) / (W / 2) - 1, y: (y + 0.5) / (H / 2) - 1 });
+      if (!p) continue;
+      const sx = Math.round(((p.x + 1) / 2) * src.width - 0.5);
+      const sy = Math.round(((p.y + 1) / 2) * src.height - 0.5);
+      if (sx < 0 || sy < 0 || sx >= src.width || sy >= src.height) continue;
+      const o = (y * W + x) * 4;
+      const s = (sy * src.width + sx) * 4;
+      buf[o] = src.data[s];
+      buf[o + 1] = src.data[s + 1];
+      buf[o + 2] = src.data[s + 2];
+    }
+  }
+
+  // Lens blur, twice.
+  for (let pass = 0; pass < 2; pass++) {
+    const next = new Uint8ClampedArray(buf.length);
+    for (let y = 0; y < H; y++) {
+      for (let x = 0; x < W; x++) {
+        for (let c = 0; c < 3; c++) {
+          let sum = 0;
+          let cnt = 0;
+          for (let dy = -1; dy <= 1; dy++) {
+            for (let dx = -1; dx <= 1; dx++) {
+              const nx = x + dx;
+              const ny = y + dy;
+              if (nx < 0 || ny < 0 || nx >= W || ny >= H) continue;
+              sum += buf[(ny * W + nx) * 4 + c];
+              cnt++;
+            }
+          }
+          next[(y * W + x) * 4 + c] = sum / cnt;
+        }
+        next[(y * W + x) * 4 + 3] = 255;
+      }
+    }
+    buf = next;
+  }
+
+  // Warm white balance, flattened contrast, lifted blacks, noise. The cast is
+  // the important one: without it this fixture would pass while a real phone
+  // failed, because nothing would exercise the grey-world correction.
+  const cast = [1.14, 1.0, 0.82];
+  let seed = 12345;
+  const rand = () => {
+    seed = (seed * 1103515245 + 12345) & 0x7fffffff;
+    return seed / 0x7fffffff - 0.5;
+  };
+  for (let i = 0; i < W * H; i++) {
+    for (let c = 0; c < 3; c++) {
+      const o = i * 4 + c;
+      buf[o] = buf[o] * cast[c] * 0.78 + 26 + rand() * 8;
+    }
+  }
+
+  return { width: W, height: H, data: buf };
+}
+
+test("a camera-warped show frame decodes to the right character", () => {
+  const text = "HELLO WORLD";
+  const n = text.length;
+  const quads: [string, Quad][] = [
+    ["frontal", FRONTAL],
+    ["tilted", TILTED],
+    ["rotated", ROTATED],
+    ["offset", OFFSET],
+  ];
+
+  for (const [name, quad] of quads) {
+    for (let k = 0; k < n; k++) {
+      const cam = fakeCamera(buildShowFrame(text, k, n), quad, 640, 360);
+      const got = scanFrame(cam);
+      assert.ok(got, name + " k=" + k + " was rejected");
+      assert.equal(got.k, k, name + " k=" + k + " read as " + got.k);
+      assert.equal(got.n, n, name + " n");
+      assert.equal(got.char, text[k], name + " k=" + k + " char");
+    }
+  }
+});
+
+test("normalise strips chroma that is only amplified noise", () => {
+  // The contrast stretch amplifies each channel's noise along with its signal,
+  // and saturation is a ratio, so near black a few counts of disagreement reads
+  // as near-full saturation. markerAt discards anything above 0.25 saturated, so
+  // without this a dark marker loses nearly every pixel to colour that is not
+  // there. The display puts a white marker on black, where the same noise is
+  // harmless -- but the correction is what makes the other polarity work at all,
+  // and nothing else in the suite would notice it going away.
+  const W = 64;
+  const H = 64;
+  const data = new Uint8ClampedArray(W * H * 4);
+  for (let i = 0; i < W * H; i++) {
+    const o = i * 4;
+    // A neutral near-black patch carrying a couple of counts of channel noise,
+    // against a neutral white ground.
+    const dark = i % 4 === 0;
+    data[o] = dark ? 2 : 250;
+    data[o + 1] = dark ? 5 : 252;
+    data[o + 2] = dark ? 9 : 247;
+    data[o + 3] = 255;
+  }
+  normalise({ width: W, height: H, data });
+
+  for (let i = 0; i < W * H; i++) {
+    const o = i * 4;
+    const { s } = rgbToHsv(data[o], data[o + 1], data[o + 2]);
+    assert.ok(s <= 0.25, "pixel " + i + " left " + s.toFixed(3) + " saturated");
+  }
+});
+
+test("a camera frame with nothing to read is rejected", () => {
+  const W = 640;
+  const H = 360;
+  const blank = new Uint8ClampedArray(W * H * 4);
+  for (let i = 0; i < W * H; i++) {
+    blank[i * 4] = 40;
+    blank[i * 4 + 1] = 40;
+    blank[i * 4 + 2] = 40;
+    blank[i * 4 + 3] = 255;
+  }
+  assert.equal(scanFrame({ width: W, height: H, data: blank }), null);
+});
+
+test("a show frame missing a fiducial is rejected", () => {
+  const cam = fakeCamera(buildShowFrame("HELLO WORLD", 3, 11, { fiducials: 3 }), FRONTAL, 640, 360);
+  assert.equal(scanFrame(cam), null);
+});
+
+test("a frame torn across a display transition is rejected", () => {
+  // A camera exposure spanning the moment the display advances: two bands carry
+  // the old character, two carry the new one. No majority, so nothing is
+  // committed -- which is the point of putting the header on all four edges
+  // rather than trusting two successive camera frames to disagree.
+  const cam = fakeCamera(buildShowFrame("HELLO WORLD", 4, 11, { bandFrom: [4, 5, 4, 5] }), FRONTAL, 640, 360);
+  assert.equal(scanFrame(cam), null);
+});
+
+// --- monochromatic display palette -------------------------------------------
+
+const parseHsl = (css: string): [number, number, number] => {
+  const m = css.match(/hsl\(([-\d.]+),\s*([-\d.]+)%,\s*([-\d.]+)%\)/);
+  assert.ok(m, "not an hsl() colour: " + css);
+  return hslToRgb(Number(m[1]), Number(m[2]) / 100, Number(m[3]) / 100);
+};
+
+test("the display palette is white ground, black furniture, one hue", () => {
+  assert.equal(SHOW_GROUND, "#ffffff");
+  assert.equal(SHOW_INK, "#000000");
+  assert.deepEqual(contrastInk(SHOW_GROUND), { r: 0, g: 0, b: 0 });
+  // The artwork sits on the white disc, so its marker is black -- the polarity
+  // that needs normalise's chroma correction to survive a camera at all.
+  assert.equal(SHOW_PRESET.bg, SHOW_GROUND);
+  assert.deepEqual(markerInk(SHOW_PRESET.bg), [0, 0, 0]);
+  // A single hue means hue cannot also carry the character order. The header
+  // band carries it instead, so this costs the frame formats nothing -- but a
+  // still of this palette is not decodable, and must not claim to be.
+  assert.equal(SHOW_PRESET.hueOrdered, false);
+  assert.equal(typeof SHOW_PRESET.hue, "number");
+});
+
+test("no point on the display curve can be mistaken for the marker", () => {
+  // The marker on the white disc is pure black, and markerAt takes any pixel
+  // within 0.06 of that -- rejecting only what is more than 0.25 saturated. A
+  // monochromatic curve ramps its lightness, so its dark end runs towards the
+  // marker's luminance; saturation is the entire thing keeping the two apart.
+  // Losing it would not fail loudly, it would decode the wrong character.
+  const n = 40;
+  for (let k = 0; k < n; k++) {
+    const [r, g, b] = parseHsl(colorFor(k, n, SHOW_PRESET));
+    const { s } = rgbToHsv(r, g, b);
+    const luma = (r * 0.299 + g * 0.587 + b * 0.114) / 255;
+    assert.ok(
+      s > 0.35,
+      "curve at k=" + k + " is only " + s.toFixed(3) + " saturated, too close to achromatic",
+    );
+    assert.ok(luma > 0.06, "curve at k=" + k + " has luma " + luma.toFixed(3) + ", into the marker's band");
+  }
+});
+
+test("the greyscale preset keeps its achromatic ramp", () => {
+  // The monochromatic branch is shared, so a fixed hue must not leak into the
+  // preset that deliberately has none.
+  const grey = presetById("gray");
+  for (let k = 0; k < 10; k++) {
+    const [r, g, b] = parseHsl(colorFor(k, 10, grey));
+    assert.equal(r, g);
+    assert.equal(g, b);
+  }
+});
+
+test("every reading point lands on the correct side of the band edge", () => {
+  // The bit is the sign of the edge's deviation at the cell centre, so this is
+  // the encoding itself. The second half is the part that matters in practice:
+  // the reader samples a disc spanning a quarter of a cell either side of
+  // centre, and the edge has to stay on the same side across all of it.
+  const n = 40;
+  const profile = bandProfile(7, n);
+  const cellDeg = 78 / SHOW.cells;
+
+  for (const edge of EDGES) {
+    const word = bandBits(7, n, edge);
+    for (let i = 0; i < SHOW.cells; i++) {
+      const centreDeg = [270, 90, 180, 0][edge] - 78 / 2 + (i + 0.5) * cellDeg;
+      const bit = word[i];
+      const at = radiusAt(profile, centreDeg);
+      if (bit) assert.ok(at > SHOW.bandRadius + SHOW.bump * 0.98, "a set cell did not bump out");
+      else assert.ok(at < SHOW.bandRadius - SHOW.bump * 0.98, "a clear cell did not indent in");
+
+      for (const off of [-0.25, 0.25]) {
+        const edgeAt = radiusAt(profile, centreDeg + off * cellDeg);
+        const clearance = Math.abs(edgeAt - SHOW.bandRadius);
+        // Easing between cell centres rather than back to nominal is what buys
+        // this: returning to nominal at every boundary would leave only half
+        // the amplitude here, and a full lobe when neighbours agree gives all
+        // of it.
+        assert.ok(clearance > SHOW.bump * 0.65, "the profile goes slack inside the sampling disc");
+        assert.equal(edgeAt > SHOW.bandRadius, bit === 1, "the profile changes sign inside the sampling disc");
+      }
+    }
+  }
+});
+
+test("the band stays solid where the anchors are punched through it", () => {
+  // The edge eases through the diagonals rather than sitting flat across them,
+  // so what matters is clearance, not that the radius is exactly nominal: an
+  // anchor that broke out to the page would stop being an isolated blob.
+  const profile = bandProfile(0, 1);
+  for (const f of SHOW.fid) {
+    const deg = (Math.atan2(f.y - SHOW.disc.y, f.x - SHOW.disc.x) * 180) / Math.PI;
+    const holeDeg = ((SHOW.fidSize / 2 / SHOW.bandRadius) * 180) / Math.PI;
+    const holeOuter = Math.hypot(f.x - SHOW.disc.x, f.y - SHOW.disc.y) + SHOW.fidSize / 2;
+    for (let d = deg - holeDeg; d <= deg + holeDeg; d += holeDeg / 4) {
+      assert.ok(radiusAt(profile, d) > holeOuter + 8, "an anchor reaches the scalloped edge");
+    }
+    assert.ok(
+      Math.hypot(f.x - SHOW.disc.x, f.y - SHOW.disc.y) - SHOW.fidSize / 2 > SHOW.disc.r + 8,
+      "an anchor breaks into the disc",
+    );
+  }
 });

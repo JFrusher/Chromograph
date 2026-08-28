@@ -73,14 +73,14 @@ const MASK_LOOSE = { s: 0.45, v: 0.35 };
 /** Below this many core pixels, assume the tight mask was too strict for this image. */
 const MIN_CORE_PIXELS = 500;
 /** A sample further than this from a legal knot position is not trusted. */
-const SNAP_TOL = 0.42 * CELL_PITCH;
+export const SNAP_TOL = 0.42 * CELL_PITCH;
 
 /**
  * A knot legally sits either on the cell centre or on the orbit ring used for
  * re-visited cells, so confidence is measured against whichever is closer.
  * Scoring against the centre alone would mark every repeated letter as doubtful.
  */
-const legalDist = (distToCentre: number) => Math.min(distToCentre, Math.abs(distToCentre - OFFSET_R));
+export const legalDist = (distToCentre: number) => Math.min(distToCentre, Math.abs(distToCentre - OFFSET_R));
 
 type Bins = {
   /** Median position of the curve in each hue bin. */
@@ -562,7 +562,7 @@ const luma = (r: number, g: number, b: number) => (r * 0.299 + g * 0.587 + b * 0
  * frame at a pure extreme, and it sits at a known position, so it is excluded by
  * geometry rather than by hoping it looks different.
  */
-function markerAt(img: ImageDataLike): Point | null {
+export function markerAt(img: ImageDataLike): Point | null {
   const { width: W, height: H, data } = img;
   const at = (x: number, y: number) => {
     const i = (y * W + x) * 4;

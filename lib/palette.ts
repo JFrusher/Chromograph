@@ -34,6 +34,12 @@ export type Preset = {
    * comes from the header rather than from colour.
    */
   hueOrdered: boolean;
+  /**
+   * A single hue for the whole curve, in degrees. Only meaningful when
+   * `hueOrdered` is false, since a monochromatic curve has no hue left to carry
+   * the order with. Absent means the achromatic ramp.
+   */
+  hue?: number;
 };
 
 /**
@@ -47,9 +53,15 @@ export const PRESETS: Preset[] = [
   { id: "silver", name: "Silver", bg: "#c0c0c0", sat: 100, light: 35, hueOrdered: true },
   { id: "paper", name: "Paper", bg: "#ffffff", sat: 100, light: 42, hueOrdered: true },
   { id: "gray", name: "Grayscale", bg: "#ffffff", sat: 0, light: 30, hueOrdered: false },
+  { id: "blue", name: "Blue", bg: "#ffffff", sat: 100, light: 45, hueOrdered: false, hue: 214 },
 ];
 
 export const presetById = (id: string): Preset => PRESETS.find((p) => p.id === id) ?? PRESETS[0];
+
+const bgLuma = (bg: string) => {
+  const [r, g, b] = hexToRgb(bg);
+  return (r * 0.299 + g * 0.587 + b * 0.114) / 255;
+};
 
 /** Colour at a fractional knot index. */
 export function colorFor(seg: number, knotCount: number, preset: Preset): string {
@@ -59,7 +71,20 @@ export function colorFor(seg: number, knotCount: number, preset: Preset): string
     // Held clear of both extremes: pure black and pure white are reserved for
     // the frame marker and its header plate.
     const t = knotCount < 2 ? 0 : seg / (knotCount - 1);
-    return `hsl(0, 0%, ${(70 - t * 55).toFixed(1)}%)`;
+    // The ramp runs away from the background, never into it. On a dark ground it
+    // also has to stop short of white, which is the marker's colour there --
+    // the same reason the light-ground ramp stops short of black.
+    const onDark = bgLuma(preset.bg) < 0.5;
+    const from = onDark ? 78 : 70;
+    const to = onDark ? 38 : 15;
+    const light = (from - t * (from - to)).toFixed(1);
+    // A monochromatic preset keeps its saturation, so the ramp stays a single
+    // hue rather than collapsing to grey. That saturation is also what keeps the
+    // curve clear of the marker: markerAt discards anything above 0.25
+    // saturation before it ever looks at luminance, so even the darkest end of
+    // a blue ramp cannot be mistaken for a black marker on white.
+    if (preset.hue !== undefined) return `hsl(${preset.hue}, ${preset.sat}%, ${light}%)`;
+    return `hsl(0, 0%, ${light}%)`;
   }
   return `hsl(${hueAt(seg, knotCount).toFixed(2)}, ${preset.sat}%, ${preset.light}%)`;
 }
@@ -82,7 +107,13 @@ export const stemHue = (k: number, knotCount: number) =>
 
 /** Colour of the stem dropped from knot k. */
 export function stemColorFor(k: number, knotCount: number, preset: Preset): string {
-  if (!preset.hueOrdered) return "hsl(0, 0%, 45%)";
+  if (!preset.hueOrdered) {
+    // Tinted towards the curve's hue, but well short of it: mid lightness keeps
+    // stems away from both the marker and the header plate, and the low
+    // saturation keeps them from reading as curve to the eye.
+    if (preset.hue !== undefined) return `hsl(${preset.hue}, 30%, 62%)`;
+    return "hsl(0, 0%, 45%)";
+  }
   return `hsl(${stemHue(k, knotCount).toFixed(2)}, 100%, 50%)`;
 }
 
